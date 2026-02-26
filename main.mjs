@@ -78,14 +78,16 @@ const PHASE_ASSAULT_END   = 1500;
 const TICK_LIMIT           = 2000;
 
 // Tower charging: how full (%) a tower must be before we stop charging it
-const TOWER_CHARGE_THRESHOLD = 0.8; // 80% full → stop wasting time, go fight
-// Max range at which a creep deviates to charge a tower opportunistically
-const TOWER_CHARGE_RANGE     = 8;
+const TOWER_CHARGE_THRESHOLD = 0.8; // 80% full → stop charging
+// Radius around a tower: if a free creep with CARRY enters this range and no
+// charger is assigned yet, ONE is assigned exclusively to that tower.
+const TOWER_ASSIGN_RADIUS    = 12;
 
 // ─── PERSISTENT STATE (survives across ticks) ────────────────────────────────
-const creepRoles       = new Map();   // id → role string
-const towerChargeState = new Map();   // id → 'WITHDRAW' | 'DELIVER'
-const towerChargeTarget= new Map();   // id → tower id being charged
+const creepRoles          = new Map();  // id → role string
+const towerChargeAssigned = new Map();  // towerId → chargerCreepId
+const chargerToTower      = new Map();  // chargerCreepId → towerId
+const chargerState        = new Map();  // chargerCreepId → 'WITHDRAW'|'DELIVER'
 let influenceMatrix    = null;
 let lastInfluenceTick  = -Infinity;
 let initialized        = false;
@@ -115,7 +117,6 @@ let myTowers      = [];
 let enemyTowers   = [];
 let containers    = [];
 let bodyParts     = [];
-let allSources    = [];  // Source objects (energy wells near towers)
 let tick          = 0;
 // per-tick action tracking (for idle detection)
 const tickActions = new Map(); // creep.id → action string this tick
@@ -141,8 +142,11 @@ function refreshWorldState() {
       const role = creepRoles.get(id) || 'unknown';
       diag.deathEvents.push({ tick, id, role });
       creepRoles.delete(id);
-      towerChargeState.delete(id);
-      towerChargeTarget.delete(id);
+      // Release tower charge assignment if this creep was a charger
+      const tid = chargerToTower.get(id);
+      if (tid) towerChargeAssigned.delete(tid);
+      chargerToTower.delete(id);
+      chargerState.delete(id);
     }
   }
 
@@ -168,8 +172,8 @@ function refreshWorldState() {
   myTowers     = allTowers.filter(t => t.my === true);
   enemyTowers  = allTowers.filter(t => t.my === false);
   containers   = getObjectsByPrototype(StructureContainer);
-  // Sources exist near towers — all sources regardless of ownership
-  allSources   = getObjectsByPrototype(Source);
+  // Energy supply for towers is in StructureContainers near each tower.
+  // Source objects require WORK to harvest (none of our creeps have WORK).
 
   bodyParts  = getObjectsByPrototype(BodyPart);
 }
@@ -212,9 +216,7 @@ function classifyCreep(creep) {
   if (h > 0) return ROLE_MEDIC;
   if (r > 0) return ROLE_RANGER;
 
-  // CARRY-only or TOUGH-only creeps: treat as vanguard (they can charge towers
-  // opportunistically via tryTowerCharge but still participate in flag captures)
-  return ROLE_VANGUARD;
+  // CARRY-only or TOUGH-only creeps: treat as vanguard (eligible for charger assignment)\n  return ROLE_VANGUARD;
 }
 
 function assignRoles() {
@@ -259,8 +261,10 @@ function reevaluateRoles() {
   for (const id of creepRoles.keys()) {
     if (!aliveIds.has(id)) {
       creepRoles.delete(id);
-      towerChargeState.delete(id);
-      towerChargeTarget.delete(id);
+      const t2id = chargerToTower.get(id);
+      if (t2id) towerChargeAssigned.delete(t2id);
+      chargerToTower.delete(id);
+      chargerState.delete(id);
     }
   }
 
@@ -322,7 +326,12 @@ function selectFocusTarget(fromPos, eligible) {
   if (eligible.length === 0) return null;
   if (eligible.length === 1) return eligible[0];
 
+  const myMedics = myCreeps.filter(c => creepRoles.get(c.id) === ROLE_MEDIC);
   return eligible.slice().sort((a, b) => {
+    // 0. Enemy threatening a medic (within 4 tiles) → eliminate first
+    const aThreatsMedic = myMedics.some(m => getRange(a, m) <= 4);
+    const bThreatsMedic = myMedics.some(m => getRange(b, m) <= 4);
+    if (aThreatsMedic !== bThreatsMedic) return aThreatsMedic ? -1 : 1;
     // 1. Kill-secured (< 100 HP)
     const aLow = a.hits <= 100;
     const bLow = b.hits <= 100;
@@ -547,103 +556,163 @@ function recordAction(creep, action) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  10b · OPPORTUNISTIC TOWER CHARGING (modular, called by all behaviors)
+//  10b · TOWER CHARGING — Dedicated charger system (one per hungry tower)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * If this creep has CARRY parts and there is a nearby tower that needs energy,
- * deviate to fill it from the closest Source. Returns true and records action
- * if the creep is actively charging; returns false otherwise so the caller
- * can continue with its normal behavior.
- *
- * Strategy:
- *   - Any creep with CARRY can charge a tower.
- *   - Towers near a Source form a self-contained charge loop:
- *       Source → withdraw → deliver to tower → repeat until tower full.
- *   - Once the nearest friendly tower is >= TOWER_CHARGE_THRESHOLD full,
- *     the creep stops charging and resumes its combat role.
- *   - We only deviate if the tower or source is within TOWER_CHARGE_RANGE tiles.
+ * Centroid (average position) of all non-medic combat creeps.
+ * Used by Medics and Rangers to stay near the fight.
  */
-function tryTowerCharge(creep) {
-  if (!hasActive(creep, CARRY)) return false;
-
-  const energy   = creep.store ? (creep.store.getUsedCapacity(RESOURCE_ENERGY) || 0) : 0;
-  const free     = creep.store ? (creep.store.getFreeCapacity(RESOURCE_ENERGY) || 0) : 0;
-  const capacity = energy + free;
-  if (capacity === 0) return false;
-
-  // Find nearest friendly tower that needs energy
-  const hungerTowers = myTowers.filter(t => {
-    const cap  = t.store ? t.store.getCapacity(RESOURCE_ENERGY)    : 0;
-    const used = t.store ? t.store.getUsedCapacity(RESOURCE_ENERGY) : 0;
-    return cap > 0 && (used / cap) < TOWER_CHARGE_THRESHOLD;
+function squadCentroid() {
+  const squad = myCreeps.filter(c => {
+    const r = creepRoles.get(c.id);
+    return r === ROLE_VANGUARD || r === ROLE_RANGER || r === ROLE_SENTINEL;
   });
-  if (hungerTowers.length === 0) {
-    // All towers sufficiently charged — clear any lingering charge state
-    towerChargeState.delete(creep.id);
-    towerChargeTarget.delete(creep.id);
-    return false;
-  }
+  if (squad.length === 0) return null;
+  const ax = Math.round(squad.reduce((s, c) => s + c.x, 0) / squad.length);
+  const ay = Math.round(squad.reduce((s, c) => s + c.y, 0) / squad.length);
+  return { x: ax, y: ay };
+}
 
-  const nearestTower = findClosestByRange(creep, hungerTowers);
-  if (!nearestTower) return false;
-
-  // Only deviate if we are within range of the tower or already in charge mode
-  const inChargeMode = towerChargeState.has(creep.id);
-  const distToTower  = getRange(creep, nearestTower);
-  if (!inChargeMode && distToTower > TOWER_CHARGE_RANGE) return false;
-
-  // Find the Source nearest to this tower (each tower has its own Source)
-  const sourcesWithEnergy = allSources.filter(s => s.energy > 0);
-  const nearestSource = sourcesWithEnergy.length > 0
-    ? findClosestByRange(nearestTower, sourcesWithEnergy)
-    : null;
-
-  let state = towerChargeState.get(creep.id) || 'WITHDRAW';
-
-  // FSM transitions
-  if (state === 'WITHDRAW') {
-    if (free <= 0) { state = 'DELIVER'; towerChargeState.set(creep.id, state); }
-    else if (!nearestSource || nearestSource.energy === 0) {
-      // Source depleted — if we already carry something, deliver it
-      if (energy > 0) { state = 'DELIVER'; towerChargeState.set(creep.id, state); }
-      else { towerChargeState.delete(creep.id); return false; } // nothing to do
+/**
+ * Each tick: release stale assignments, then assign ONE free CARRY creep per
+ * hungry tower that has at least one candidate within TOWER_ASSIGN_RADIUS.
+ *
+ * Energy supply: StructureContainer objects near towers.
+ * (Source objects require WORK to harvest — none of our creeps have WORK.)
+ */
+function assignTowerChargers() {
+  // Release: dead charger or tower now charged
+  for (const [towerId, cpId] of [...towerChargeAssigned.entries()]) {
+    const creep = myCreeps.find(c => c.id === cpId);
+    if (!creep) {
+      towerChargeAssigned.delete(towerId);
+      chargerToTower.delete(cpId);
+      chargerState.delete(cpId);
+      continue;
     }
-  }
-  if (state === 'DELIVER' && energy <= 0) {
-    state = 'WITHDRAW'; towerChargeState.set(creep.id, state);
-    // Check if tower is now sufficiently charged
-    const used = nearestTower.store ? nearestTower.store.getUsedCapacity(RESOURCE_ENERGY) : 0;
-    const cap  = nearestTower.store ? nearestTower.store.getCapacity(RESOURCE_ENERGY)    : 1;
-    if ((used / cap) >= TOWER_CHARGE_THRESHOLD) {
-      towerChargeState.delete(creep.id);
-      towerChargeTarget.delete(creep.id);
-      return false; // tower is charged — resume combat
+    const tower = getObjectById(towerId);
+    if (!tower) {
+      towerChargeAssigned.delete(towerId);
+      chargerToTower.delete(cpId);
+      chargerState.delete(cpId);
+      continue;
+    }
+    const used = tower.store ? tower.store.getUsedCapacity(RESOURCE_ENERGY) : 0;
+    const cap  = tower.store ? tower.store.getCapacity(RESOURCE_ENERGY) : 1;
+    if (cap > 0 && (used / cap) >= TOWER_CHARGE_THRESHOLD) {
+      // Tower charged → release charger back to combat
+      towerChargeAssigned.delete(towerId);
+      chargerToTower.delete(cpId);
+      chargerState.delete(cpId);
     }
   }
 
-  towerChargeState.set(creep.id, state);
-  towerChargeTarget.set(creep.id, nearestTower.id);
+  // Assign: one free charger per still-hungry tower
+  for (const tower of myTowers) {
+    if (towerChargeAssigned.has(tower.id)) continue;
+    const used = tower.store ? tower.store.getUsedCapacity(RESOURCE_ENERGY) : 0;
+    const cap  = tower.store ? tower.store.getCapacity(RESOURCE_ENERGY) : 1;
+    if (cap === 0 || (used / cap) >= TOWER_CHARGE_THRESHOLD) continue;
+
+    // Only assign if there is a container with energy near this tower
+    const energySrc = containers.filter(c =>
+      c.store && c.store.getUsedCapacity(RESOURCE_ENERGY) > 0
+    );
+    if (energySrc.length === 0) continue;
+
+    // Candidate: free CARRY creep within TOWER_ASSIGN_RADIUS of tower
+    const candidates = myCreeps.filter(c =>
+      !chargerToTower.has(c.id) &&
+      hasActive(c, CARRY) &&
+      getRange(c, tower) <= TOWER_ASSIGN_RADIUS
+    );
+    if (candidates.length === 0) continue;
+
+    const chosen = findClosestByRange(tower, candidates);
+    if (!chosen) continue;
+    towerChargeAssigned.set(tower.id, chosen.id);
+    chargerToTower.set(chosen.id, tower.id);
+    chargerState.set(chosen.id, 'WITHDRAW');
+  }
+}
+
+/**
+ * Behavior for an explicitly assigned tower charger.
+ * FSM: WITHDRAW (fetch energy from closest container) → DELIVER (transfer to tower).
+ * Steps on BodyParts opportunistically when they are close by.
+ */
+function behaviorCharger(creep) {
+  const towerId = chargerToTower.get(creep.id);
+  if (!towerId) return;
+  const tower = getObjectById(towerId);
+  if (!tower) {
+    chargerToTower.delete(creep.id);
+    chargerState.delete(creep.id);
+    return;
+  }
+
+  const energy = creep.store ? (creep.store.getUsedCapacity(RESOURCE_ENERGY) || 0) : 0;
+  const free   = creep.store ? (creep.store.getFreeCapacity(RESOURCE_ENERGY) || 0)  : 0;
+  let   state  = chargerState.get(creep.id) || 'WITHDRAW';
+
+  // Find closest container with energy (use tower position for cache efficiency)
+  const energyContainers = containers.filter(c =>
+    c.store && c.store.getUsedCapacity(RESOURCE_ENERGY) > 0
+  );
+  const src = energyContainers.length > 0 ? findClosestByRange(tower, energyContainers) : null;
+
+  // State transitions
+  if (state === 'WITHDRAW' && free <= 0)   { state = 'DELIVER'; }
+  if (state === 'DELIVER'  && energy <= 0) { state = 'WITHDRAW'; }
+  chargerState.set(creep.id, state);
 
   if (state === 'WITHDRAW') {
-    if (!nearestSource) return false;
-    if (getRange(creep, nearestSource) <= 1) {
-      creep.withdraw(nearestSource, RESOURCE_ENERGY);
+    if (!src) {
+      // No container energy available — deliver carry if any, else wait near tower
+      if (energy > 0) {
+        chargerState.set(creep.id, 'DELIVER');
+        if (getRange(creep, tower) <= 1) {
+          creep.transfer(tower, RESOURCE_ENERGY);
+          recordAction(creep, 'harvest');
+        } else {
+          creep.moveTo(tower);
+          recordAction(creep, 'move');
+        }
+      } else {
+        // Step on body part nearby while containers refill
+        const bp = bodyParts.length > 0 ? findClosestByRange(creep, bodyParts) : null;
+        if (bp && getRange(creep, bp) <= 6) {
+          creep.moveTo(bp);
+        } else if (getRange(creep, tower) > 2) {
+          creep.moveTo(tower);
+        }
+        recordAction(creep, 'move');
+      }
+      return;
+    }
+    if (getRange(creep, src) <= 1) {
+      creep.withdraw(src, RESOURCE_ENERGY);
       recordAction(creep, 'harvest');
     } else {
-      creep.moveTo(nearestSource, pathOpts());
+      // Move toward container; body parts on path are auto-collected on adjacent tile
+      creep.moveTo(src);
       recordAction(creep, 'move');
     }
+    return;
+  }
+
+  // DELIVER state: bring energy to tower
+  if (getRange(creep, tower) <= 1) {
+    creep.transfer(tower, RESOURCE_ENERGY);
+    // After delivering, divert to step on any close body part
+    const bp = bodyParts.length > 0 ? findClosestByRange(creep, bodyParts) : null;
+    if (bp && getRange(creep, bp) <= 4) creep.moveTo(bp);
+    recordAction(creep, 'harvest');
   } else {
-    if (getRange(creep, nearestTower) <= 1) {
-      creep.transfer(nearestTower, RESOURCE_ENERGY);
-      recordAction(creep, 'harvest');
-    } else {
-      creep.moveTo(nearestTower, pathOpts());
-      recordAction(creep, 'move');
-    }
+    creep.moveTo(tower);
+    recordAction(creep, 'move');
   }
-  return true;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -653,10 +722,6 @@ function tryTowerCharge(creep) {
 function behaviorVanguard(creep) {
   // L5 — Emergency retreat
   if (shouldRetreat(creep)) { executeRetreat(creep); recordAction(creep, 'move'); return; }
-
-  // La — Opportunistic tower charging (only if no enemies nearby)
-  const nearbyEnemies = findInRange(creep, enemies, 8);
-  if (nearbyEnemies.length === 0 && tryTowerCharge(creep)) return;
 
   // L4/L3 — Melee combat: attack adjacent enemies
   const adj = findInRange(creep, enemies, 1);
@@ -693,9 +758,17 @@ function behaviorVanguard(creep) {
   // L1 — BodyPart pickup
   if (tryPickupBodyPart(creep)) { recordAction(creep, 'move'); return; }
 
-  // L2 — Advance toward objective
+  // L2 — Advance toward objective (soft cohesion: don't outrun medics)
   const obj = getObjective(creep, ROLE_VANGUARD);
-  if (obj) { creep.moveTo(obj, pathOpts()); recordAction(creep, 'move'); }
+  if (obj) {
+    const medics = myCreeps.filter(c => creepRoles.get(c.id) === ROLE_MEDIC);
+    const nearestMedic = medics.length > 0 ? findClosestByRange(creep, medics) : null;
+    if (!nearestMedic || getRange(creep, nearestMedic) <= 7) {
+      creep.moveTo(obj, pathOpts());
+    }
+    // If medics are far behind (> 7) hold position one tick so they catch up
+    recordAction(creep, 'move');
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -707,16 +780,15 @@ function behaviorRanger(creep) {
   if (shouldRetreat(creep)) { executeRetreat(creep); recordAction(creep, 'move'); return; }
 
   const inR1 = findInRange(creep, enemies, 1);
+  const inR2 = findInRange(creep, enemies, 2);
   const inR3 = findInRange(creep, enemies, 3);
 
-  // La — Opportunistic tower charging (only if area is clear)
-  if (inR1.length === 0 && inR3.length === 0 && tryTowerCharge(creep)) return;
-
-  // L4 — Kiting: enemies too close → retreat + shoot
-  if (inR1.length > 0) {
+  // L4 — Kiting: flee if enemy within range 2 to maintain ideal range 3
+  if (inR1.length > 0 || inR2.length > 0) {
+    const threats = inR1.length > 0 ? inR1 : inR2;
     const result = searchPath(
       creep,
-      inR1.map(e => ({ pos: e, range: KITE_FLEE_RANGE })),
+      threats.map(e => ({ pos: e, range: KITE_FLEE_RANGE })),
       pathOpts(true),
     );
     if (result.path.length > 0) {
@@ -726,7 +798,7 @@ function behaviorRanger(creep) {
     if (inR3.length >= 3) {
       creep.rangedMassAttack();
     } else {
-      const t = selectFocusTarget(creep, inR1);
+      const t = selectFocusTarget(creep, threats);
       if (t) creep.rangedAttack(t);
     }
     recordAction(creep, 'attack');
@@ -761,7 +833,15 @@ function behaviorRanger(creep) {
   // L1 — BodyPart pickup
   if (tryPickupBodyPart(creep)) { recordAction(creep, 'move'); return; }
 
-  // L2 — Advance toward objective
+  // L2 — Advance: close to firing range (≤ 3) or push objective
+  if (enemies.length > 0) {
+    const nearestEnemy = findClosestByRange(creep, enemies);
+    if (nearestEnemy && getRange(creep, nearestEnemy) > 3) {
+      creep.moveTo(nearestEnemy, pathOpts());
+      recordAction(creep, 'move');
+      return;
+    }
+  }
   const phase = getPhase();
   if (phase === 4 && myFlagCount() > enemyFlagCount() && myFlag) {
     creep.moveTo(myFlag, pathOpts());
@@ -796,13 +876,6 @@ function behaviorMedic(creep) {
     }
     recordAction(creep, 'move');
     return;
-  }
-
-  // La — Opportunistic tower charging when area is safe
-  const nearbyEnemies = findInRange(creep, enemies, 6);
-  if (nearbyEnemies.length === 0) {
-    const damaged = myCreeps.filter(c => c.id !== creep.id && c.hits < c.hitsMax);
-    if (damaged.length === 0 && tryTowerCharge(creep)) return;
   }
 
   // L3 — Triage: find best heal target
@@ -851,14 +924,18 @@ function behaviorMedic(creep) {
   // L1 — BodyPart pickup
   if (tryPickupBodyPart(creep)) { recordAction(creep, 'move'); return; }
 
-  // L0 — Follow squad: stay near combat creeps (deathball cohesion)
-  const combatants = myCreeps.filter(c => {
-    const r = creepRoles.get(c.id);
-    return r === ROLE_VANGUARD || r === ROLE_RANGER;
-  });
-  if (combatants.length > 0) {
-    const nearest = findClosestByRange(creep, combatants);
-    if (nearest && creep.getRangeTo(nearest) > 2) {
+  // L0 — Follow squad centroid to stay within healing range (deathball cohesion)
+  const centroid = squadCentroid();
+  if (centroid && getRange(creep, centroid) > 3) {
+    creep.moveTo(centroid, pathOpts());
+  } else {
+    // Already near centroid — close gap to nearest combatant
+    const combatants = myCreeps.filter(c => {
+      const r = creepRoles.get(c.id);
+      return r === ROLE_VANGUARD || r === ROLE_RANGER || r === ROLE_SENTINEL;
+    });
+    const nearest = combatants.length > 0 ? findClosestByRange(creep, combatants) : null;
+    if (nearest && getRange(creep, nearest) > 3) {
       creep.moveTo(nearest, pathOpts());
     }
   }
@@ -900,11 +977,6 @@ function behaviorSentinel(creep) {
   if (!actionTaken && selfDamaged && hasActive(creep, HEAL)) {
     creep.heal(creep);
     actionTaken = true;
-  }
-
-  // Opportunistic tower charging when calm
-  if (!actionTaken && threatsNearFlag.length === 0) {
-    if (tryTowerCharge(creep)) return;
   }
 
   // Movement: intercept threats or patrol near flag
@@ -989,15 +1061,15 @@ function tickLog() {
     return `${used}/${cap}`;
   }).join(' ');
 
-  const srcE = allSources.reduce((s, src) => s + src.energy, 0);
   const myF  = allFlags.filter(f => f.my === true).length;
   const enF  = allFlags.filter(f => f.my === false).length;
   const neuF = allFlags.filter(f => f.my === undefined).length;
+  const chargerCount = chargerToTower.size;
 
   console.log(
     `[T${tick}] CPU=${cpu}ms alive=${myCreeps.length} enemies=${enemies.length}` +
     ` flags(my=${myF} en=${enF} neu=${neuF})` +
-    ` towers=[${towerStatus}] srcE=${srcE}` +
+    ` towers=[${towerStatus}] chargers=${chargerCount}` +
     ` roles=${JSON.stringify(roles)}`
   );
 }
@@ -1035,11 +1107,14 @@ function drawVisuals() {
     vis.rect({ x: creep.x - 0.5, y: creep.y + 0.4 }, 1, 0.15, { fill: '#333333', opacity: 0.7, stroke: undefined });
     vis.rect({ x: creep.x - 0.5, y: creep.y + 0.4 }, hpRatio, 0.15, { fill: color, opacity: 0.9, stroke: undefined });
   }
-  // Source energy bars
-  for (const src of getObjectsByPrototype(Source)) {
-    const ratio = src.energy / src.energyCapacity;
-    vis.rect({ x: src.x - 0.5, y: src.y + 0.4 }, ratio, 0.15, { fill: '#ffff00', opacity: 0.7, stroke: undefined });
-    vis.text(`${src.energy}`, { x: src.x, y: src.y - 0.6 }, { font: '0.35', color: '#ffff88', opacity: 0.9 });
+  // Container energy bars (tower supply depots)
+  for (const cont of containers) {
+    const energy = cont.store ? cont.store.getUsedCapacity(RESOURCE_ENERGY) : 0;
+    const cap    = cont.store ? cont.store.getCapacity(RESOURCE_ENERGY) : 0;
+    if (cap === 0) continue;
+    const ratio = energy / cap;
+    vis.rect({ x: cont.x - 0.5, y: cont.y + 0.4 }, ratio, 0.15, { fill: '#ffff00', opacity: 0.7, stroke: undefined });
+    vis.text(`${energy}`, { x: cont.x, y: cont.y - 0.6 }, { font: '0.35', color: '#ffff88', opacity: 0.9 });
   }
 }
 
@@ -1104,9 +1179,15 @@ export function loop() {
   // ─── TOWER ACTIONS ──────────────────────────────────────
   towerController();
 
+  // ─── ASSIGN TOWER CHARGERS (one per hungry tower) ────────
+  assignTowerChargers();
+
   // ─── CREEP ACTIONS ──────────────────────────────────────
   for (const creep of myCreeps) {
     if (creep.spawning) continue;
+    // Explicitly assigned tower chargers run their own behavior
+    if (chargerToTower.has(creep.id)) { behaviorCharger(creep); continue; }
+
     const role = creepRoles.get(creep.id);
 
     switch (role) {
