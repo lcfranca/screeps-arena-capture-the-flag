@@ -532,8 +532,10 @@ function commandLayer() {
   }
 
   // ── Global focus target ────────────────────────────────────────────
+  // Use squad centroid (not map center) so focus is on enemies near the fight.
   if (enemies.length > 0) {
-    globalFocusTarget = selectFocusTarget({ x: 50, y: 50 }, enemies);
+    const sqCenter = squadCentroid() || { x: 50, y: 50 };
+    globalFocusTarget = selectFocusTarget(sqCenter, enemies);
   } else {
     globalFocusTarget = null;
   }
@@ -744,12 +746,13 @@ function doCombatAction(creep) {
       const damaged = myCreeps.filter(c => c.hits < c.hitsMax && c.id !== creep.id);
       const adjDmg  = findInRange(creep, damaged, 1);
       const nearDmg = findInRange(creep, damaged, 3);
+      // Heal by HP ratio (most critical first), not absolute HP
       if (adjDmg.length > 0) {
-        const t = adjDmg.reduce((b, c) => c.hits < b.hits ? c : b);
+        const t = adjDmg.reduce((b, c) => (c.hits/c.hitsMax) < (b.hits/b.hitsMax) ? c : b);
         creep.heal(t); return 'heal';
       }
       if (nearDmg.length > 0) {
-        const t = nearDmg.reduce((b, c) => c.hits < b.hits ? c : b);
+        const t = nearDmg.reduce((b, c) => (c.hits/c.hitsMax) < (b.hits/b.hitsMax) ? c : b);
         creep.rangedHeal(t); return 'heal';
       }
       if (creep.hits < creep.hitsMax) { creep.heal(creep); return 'heal'; }
@@ -898,10 +901,23 @@ function doMoveAction(creep) {
       return;
     }
 
-    // P3-M2: Any ally damaged → chase most-damaged (classic healer behaviour)
+    // P3-M2: ally damaged → approach ONLY if safe to do so.
+    // "Safe": the damaged ally has no enemies within range 3 (rangedAttack range).
+    // If ally is inside the fight, use rangedHeal from current position; don't walk in.
     const damaged = frontline.filter(c => c.hits < c.hitsMax);
     if (damaged.length > 0) {
       const worst = damaged.reduce((b, c) => (c.hits / c.hitsMax) < (b.hits / b.hitsMax) ? c : b);
+      const allyInDanger = findInRange(worst, enemies, 4).length > 0;
+      if (allyInDanger) {
+        // Stay where we are; doCombatAction will rangedHeal if within range 3.
+        // If too far to rangedHeal, edge closer along a safe path but stop at range 3.
+        if (getRange(creep, worst) > 3) {
+          // Move toward ally but only by 1 step — pathOpts influence map penalizes enemy zones
+          creep.moveTo(worst, pathOpts());
+        }
+        return;
+      }
+      // Ally is clear: approach normally
       if (getRange(creep, worst) > 1) { creep.moveTo(worst, pathOpts()); return; }
       return;
     }
@@ -938,14 +954,22 @@ function doMoveAction(creep) {
       }
       return;
     }
-    // Advance toward nearest enemy until we reach ideal firing range (3)
+    // Advance toward nearest enemy until we reach ideal firing range (3),
+    // but only if we are not isolated from the squad. A ranger firing alone
+    // at long range accomplishes little and draws focus without support.
     if (enemies.length > 0) {
       const nearest = findClosestByRange(creep, enemies);
-      if (nearest && getRange(creep, nearest) > 3) {
+      const squadNear = myCreeps.filter(c => c.id !== creep.id && getRange(creep, c) <= 8).length > 0;
+      if (nearest && getRange(creep, nearest) > 3 && squadNear) {
         creep.moveTo(nearest, pathOpts()); return;
       }
     }
-    // In range or no enemies: advance to commander target
+    // Not in range or isolated: follow squad centroid to stay with the group
+    const centroid = squadCentroid();
+    if (centroid && getRange(creep, centroid) > 4) {
+      creep.moveTo(centroid, pathOpts()); return;
+    }
+    // Close to centroid: advance to commander target
     const obj = creepTargets.get(creep.id);
     if (obj) creep.moveTo(obj, pathOpts());
     return;
@@ -987,7 +1011,15 @@ function doMoveAction(creep) {
       const t = selectFocusTarget(creep, nearEnemies);
       if (t) { creep.moveTo(t, pathOpts()); return; }
     }
-    // Outnumbered locally: advance toward commander target (same flag as allies → group up naturally)
+  }
+  // No local engagement: stay cohesive with the squad.
+  // Move to commander target, but if we are isolated (no ally within range 8)
+  // first close to the squad centroid so the group advances together.
+  const centroid = squadCentroid();
+  if (centroid && myCreeps.filter(c => c.id !== creep.id && getRange(creep, c) <= 8).length === 0) {
+    // Isolated — rejoin squad before pushing forward
+    creep.moveTo(centroid, pathOpts());
+    return;
   }
   const obj = creepTargets.get(creep.id);
   if (obj) creep.moveTo(obj, pathOpts());
