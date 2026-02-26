@@ -776,14 +776,21 @@ function doMoveAction(creep) {
   }
 
   // P2b: Uncaptured flag within tiny radius — step on it without breaking combat.
-  // Only diverts if no enemy is melee-adjacent (don't walk into open attacks).
-  // Mirrors the body-part micro-divert pattern exactly.
+  // Safety guard: only divert if the area is clear (no enemies within range 4)
+  // OR a friendly medic is within rangedHeal range (≤ 3), ensuring the creep
+  // won't walk unsupported into an enemy cluster to grab a flag.
   const uncaptured = [...neutralFlags, ...enemyFlags];
-  if (uncaptured.length > 0 && findInRange(creep, enemies, 1).length === 0) {
+  if (uncaptured.length > 0) {
     const nearFlag = findInRange(creep, uncaptured, FLAG_CAPTURE_RADIUS);
     if (nearFlag.length > 0) {
-      const closest = findClosestByRange(creep, nearFlag);
-      if (closest) { creep.moveTo(closest); return; }
+      const enemiesNear    = findInRange(creep, enemies, 4);
+      const medicCoverage  = myCreeps.some(
+        c => creepRoles.get(c.id) === ROLE_MEDIC && getRange(creep, c) <= 3
+      );
+      if (enemiesNear.length === 0 || medicCoverage) {
+        const closest = findClosestByRange(creep, nearFlag);
+        if (closest) { creep.moveTo(closest); return; }
+      }
     }
   }
 
