@@ -407,6 +407,21 @@ function buildInfluenceMap() {
     }
   }
 
+  // ── Arena edge penalty — prevents kiting/fleeing into walls/corners ─────────
+  // Tiles within WALL_REPEL_DIST of any edge get a progressive cost penalty.
+  // This biases ALL searchPath(flee) calls toward the center of the map.
+  const WALL_REPEL_DIST = 8;
+  for (let x = 0; x < 100; x++) {
+    for (let y = 0; y < 100; y++) {
+      if (getTerrainAt({ x, y }) === TERRAIN_WALL) continue;
+      const edgeDist = Math.min(x, y, 99 - x, 99 - y);
+      if (edgeDist < WALL_REPEL_DIST) {
+        const penalty = Math.floor((WALL_REPEL_DIST - edgeDist) * 10);
+        cm.set(x, y, Math.min(254, cm.get(x, y) + penalty));
+      }
+    }
+  }
+
   // ── Ally stacking avoidance ────────────────────────────
   for (const ally of myCreeps) {
     const cur = cm.get(ally.x, ally.y);
@@ -930,6 +945,15 @@ function doMoveAction(creep) {
       const t = selectFocusTarget(creep, threats);
       if (t) { creep.moveTo(t, pathOpts()); return; }
     }
+
+    // Offensive redeploy: home flag is safe AND we are losing flags → join attack.
+    // Sentinel contributes DPS instead of idling 1000+ ticks near an uncontested flag.
+    const flagBalance = myFlagCount() - enemyFlagCount();
+    if (threats.length === 0 && flagBalance < 0 && enemies.length > 0) {
+      const target = globalFocusTarget || findClosestByRange(creep, enemies);
+      if (target) { creep.moveTo(target, pathOpts()); return; }
+    }
+
     // Patrol near flag
     if (myFlag && getRange(creep, myFlag) > SENTINEL_PATROL_RANGE) {
       creep.moveTo(myFlag, pathOpts());
