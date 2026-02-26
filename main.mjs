@@ -348,6 +348,12 @@ function selectFocusTarget(fromPos, eligible) {
     const bLow = b.hits <= 100;
     if (aLow !== bLow) return aLow ? -1 : 1;
 
+    // 1b. "Unhealed" bonus: enemy with no friendly healer within range 5 is easier to kill.
+    // Prefer un-sustained targets so we can actually eliminate them despite enemy heals.
+    const aUnhealed = !enemies.some(e => e.id !== a.id && countActive(e, HEAL) > 0 && getRange(e, a) <= 5);
+    const bUnhealed = !enemies.some(e => e.id !== b.id && countActive(e, HEAL) > 0 && getRange(e, b) <= 5);
+    if (aUnhealed !== bUnhealed) return aUnhealed ? -1 : 1;
+
     // 2. Healers first (remove sustain)
     const aH = countActive(a, HEAL) > 0;
     const bH = countActive(b, HEAL) > 0;
@@ -897,56 +903,66 @@ function doMoveAction(creep) {
     if (pullingBack.length > 0) {
       const worst = pullingBack.reduce((b, c) => (c.hits / c.hitsMax) < (b.hits / b.hitsMax) ? c : b);
       if (getRange(creep, worst) > 1) { creep.moveTo(worst, pathOpts()); return; }
-      // Already adjacent: stay put (heal fires via doCombatAction)
       return;
     }
 
-    // P3-M2: ally damaged → approach ONLY if safe to do so.
-    // "Safe": the damaged ally has no enemies within range 3 (rangedAttack range).
-    // If ally is inside the fight, use rangedHeal from current position; don't walk in.
+    // P3-M2: Chase most-damaged ally unconditionally.
+    // The influence map (pathOpts) already penalizes tiles near enemies, so the path
+    // naturally routes around hot zones. The old "allyInDanger" stop was preventing
+    // medics from healing anyone in active combat — i.e., 100% of the time.
+    // Medics must stay adjacent (range 1 = full heal) or at most range 3 (rangedHeal).
     const damaged = frontline.filter(c => c.hits < c.hitsMax);
     if (damaged.length > 0) {
       const worst = damaged.reduce((b, c) => (c.hits / c.hitsMax) < (b.hits / b.hitsMax) ? c : b);
-      const allyInDanger = findInRange(worst, enemies, 4).length > 0;
-      if (allyInDanger) {
-        // Stay where we are; doCombatAction will rangedHeal if within range 3.
-        // If too far to rangedHeal, edge closer along a safe path but stop at range 3.
-        if (getRange(creep, worst) > 3) {
-          // Move toward ally but only by 1 step — pathOpts influence map penalizes enemy zones
-          creep.moveTo(worst, pathOpts());
-        }
-        return;
-      }
-      // Ally is clear: approach normally
       if (getRange(creep, worst) > 1) { creep.moveTo(worst, pathOpts()); return; }
       return;
     }
 
-    // P3-M3: Everyone healthy → follow squad centroid at safe range.
-    // Do NOT chase the most-forward ally — that walks medics into the fight.
-    // M4 (centroid follow) handles this directly.
+    // P3-M3: Nobody damaged → pre-position at range 2 of the most-forward combat ally.
+    // "Most-forward" = closest to enemy centroid. Being at range 2 means:
+    //   • Vanguard is body-blocking between medic and enemies
+    //   • Full heal (range 1) reachable in 1 move step
+    //   • rangedHeal (range 3) available immediately without moving
+    if (frontline.length > 0 && enemies.length > 0) {
+      const eCx = Math.round(enemies.reduce((s, e) => s + e.x, 0) / enemies.length);
+      const eCy = Math.round(enemies.reduce((s, e) => s + e.y, 0) / enemies.length);
+      const frontmost = frontline.reduce((b, c) =>
+        getRange(c, {x: eCx, y: eCy}) < getRange(b, {x: eCx, y: eCy}) ? c : b
+      );
+      const d = getRange(creep, frontmost);
+      if (d > 2) { creep.moveTo(frontmost, pathOpts()); return; }
+      return; // in position
+    }
 
     // P3-M4: Fallback — follow squad centroid
     const centroid = squadCentroid();
     if (centroid && getRange(creep, centroid) > 3) {
       creep.moveTo(centroid, pathOpts()); return;
     }
-    // Near centroid: advance with squad to commander target
     const obj = creepTargets.get(creep.id);
     if (obj) creep.moveTo(obj, pathOpts());
     return;
   }
 
   if (role === ROLE_RANGER) {
-    // Kite: react when enemy within range 4 so we never absorb melee hits.
-    // Melee moves 1 tile/tick — triggering at 2 means we're already at range 1
-    // before the flee fires. Triggering at 4 gives 2 ticks of buffer.
-    // Flee target: range 5 from ALL threatening enemies (safe ranged firing zone).
+    // Kite: react when enemy within range 4.
+    // Flee to range 4 (not 5) to stay within rangedHeal coverage of medics.
+    // Bias kite direction: flee toward nearest medic when possible so rangers
+    // never drift out of heal range during combat.
     const inR4 = findInRange(creep, enemies, 4);
     if (inR4.length > 0) {
+      const myMedics = myCreeps.filter(c => creepRoles.get(c.id) === ROLE_MEDIC);
+      const nearestMedic = myMedics.length > 0 ? findClosestByRange(creep, myMedics) : null;
+      // If we are already far from medics, kite toward them (flee from enemies
+      // but the cost matrix already biases toward ally positions).
+      if (nearestMedic && getRange(creep, nearestMedic) > 4) {
+        // Move toward medic— influence map still penalizes enemy tiles
+        creep.moveTo(nearestMedic, pathOpts());
+        return;
+      }
       const result = searchPath(
         creep,
-        inR4.map(e => ({ pos: e, range: 5 })),
+        inR4.map(e => ({ pos: e, range: 4 })),
         pathOpts(true),
       );
       if (result.path.length > 0) {
@@ -955,8 +971,7 @@ function doMoveAction(creep) {
       return;
     }
     // Advance toward nearest enemy until we reach ideal firing range (3),
-    // but only if we are not isolated from the squad. A ranger firing alone
-    // at long range accomplishes little and draws focus without support.
+    // but only if squad is nearby (ally within r8). Isolated ranger rejoins first.
     if (enemies.length > 0) {
       const nearest = findClosestByRange(creep, enemies);
       const squadNear = myCreeps.filter(c => c.id !== creep.id && getRange(creep, c) <= 8).length > 0;
@@ -964,12 +979,16 @@ function doMoveAction(creep) {
         creep.moveTo(nearest, pathOpts()); return;
       }
     }
-    // Not in range or isolated: follow squad centroid to stay with the group
+    // Not in range or isolated: anchor to nearest medic if available, else centroid
+    const myMedicsR = myCreeps.filter(c => creepRoles.get(c.id) === ROLE_MEDIC);
+    const anchorMedic = myMedicsR.length > 0 ? findClosestByRange(creep, myMedicsR) : null;
+    if (anchorMedic && getRange(creep, anchorMedic) > 3) {
+      creep.moveTo(anchorMedic, pathOpts()); return;
+    }
     const centroid = squadCentroid();
     if (centroid && getRange(creep, centroid) > 4) {
       creep.moveTo(centroid, pathOpts()); return;
     }
-    // Close to centroid: advance to commander target
     const obj = creepTargets.get(creep.id);
     if (obj) creep.moveTo(obj, pathOpts());
     return;
