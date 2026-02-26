@@ -88,6 +88,7 @@ const creepRoles          = new Map();  // id → role string
 const towerChargeAssigned = new Map();  // towerId → chargerCreepId
 const chargerToTower      = new Map();  // chargerCreepId → towerId
 const chargerState        = new Map();  // chargerCreepId → 'WITHDRAW'|'DELIVER'
+const creepTargets        = new Map();  // creepId → target {x,y} set by commandLayer each tick
 let influenceMatrix    = null;
 let lastInfluenceTick  = -Infinity;
 let initialized        = false;
@@ -216,7 +217,8 @@ function classifyCreep(creep) {
   if (h > 0) return ROLE_MEDIC;
   if (r > 0) return ROLE_RANGER;
 
-  // CARRY-only or TOUGH-only creeps: treat as vanguard (eligible for charger assignment)\n  return ROLE_VANGUARD;
+  // CARRY/TOUGH/MOVE-only creeps: treat as vanguard (charger-eligible)
+  return ROLE_VANGUARD;
 }
 
 function assignRoles() {
@@ -445,101 +447,32 @@ function shouldRetreat(creep) {
   return creep.hits < creep.hitsMax * RETREAT_HP_RATIO;
 }
 
-function executeRetreat(creep) {
-  // Self-heal if possible (takes the action slot)
-  if (hasActive(creep, HEAL)) {
-    creep.heal(creep);
-  } else if (hasActive(creep, RANGED_ATTACK)) {
-    // Shoot while running
-    const inR3 = findInRange(creep, enemies, 3);
-    if (inR3.length >= 3) creep.rangedMassAttack();
-    else if (inR3.length > 0) creep.rangedAttack(inR3[0]);
-  }
-
-  // Flee from nearby enemies
-  const nearby = findInRange(creep, enemies, 7);
-  if (nearby.length > 0) {
-    const result = searchPath(
-      creep,
-      nearby.map(e => ({ pos: e, range: EMERGENCY_FLEE_RANGE })),
-      pathOpts(true),
-    );
-    if (result.path.length > 0) {
-      const nx = result.path[0];
-      creep.move(getDirection(nx.x - creep.x, nx.y - creep.y));
-      return;
-    }
-  }
-
-  // Fallback: run to own flag
-  if (myFlag) creep.moveTo(myFlag);
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
-//  8 · BODY PART COLLECTION (Behavior Layer 1)
+//  9 · COMMANDER LAYER — Global target assignment (runs once per tick)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function tryPickupBodyPart(creep) {
-  if (bodyParts.length === 0) return false;
+/**
+ * Picks ONE global objective and writes per-creep movement targets.
+ * All combat creeps share the same directive — no conflicting objectives.
+ * See docs/strategy.md §3 for architecture rationale.
+ */
+function commandLayer() {
+  let objective = null;
 
-  // Already on same tile → collected automatically
-  const onTile = bodyParts.filter(bp => bp.x === creep.x && bp.y === creep.y);
-  if (onTile.length > 0) return true;
-
-  // Deviate slightly if close
-  const nearby = findInRange(creep, bodyParts, BODYPART_DEVIATE_RANGE);
-  if (nearby.length === 0) return false;
-
-  const prio = { [HEAL]: 4, [ATTACK]: 3, [RANGED_ATTACK]: 2, [MOVE]: 1 };
-  nearby.sort((a, b) => (prio[b.type] || 0) - (prio[a.type] || 0));
-  creep.moveTo(nearby[0]);
-  return true;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  9 · OBJECTIVE SELECTOR — phase-aware target
-// ═══════════════════════════════════════════════════════════════════════════════
-
-function getObjective(creep, role) {
-  const phase = getPhase();
-
-  // Phase 1: rush neutral flags
-  if (phase === 1) {
-    if (neutralFlags.length > 0) return findClosestByRange(creep, neutralFlags);
-    if (enemyFlags.length > 0)   return findClosestByRange(creep, enemyFlags);
-    return myFlag;
+  // Priority: expand neutrals → push enemy → hold own
+  if (neutralFlags.length > 0) {
+    objective = findClosestByRange({ x: 50, y: 50 }, neutralFlags);
+  } else if (enemyFlags.length > 0) {
+    objective = findClosestByRange({ x: 50, y: 50 }, enemyFlags);
+  } else {
+    objective = myFlag;
   }
 
-  // Phase 2-3: push enemy flags
-  if (phase === 2 || phase === 3) {
-    if (enemyFlags.length > 0)   return findClosestByRange(creep, enemyFlags);
-    if (neutralFlags.length > 0) return findClosestByRange(creep, neutralFlags);
-    return myFlag;
+  for (const creep of myCreeps) {
+    if (chargerToTower.has(creep.id)) continue; // charger has its own target
+    const role = creepRoles.get(creep.id);
+    creepTargets.set(creep.id, role === ROLE_SENTINEL ? (myFlag || objective) : objective);
   }
-
-  // Phase 4: endgame clock management
-  const myF = myFlagCount();
-  const enF = enemyFlagCount();
-
-  if (myF > enF) {
-    // Ahead → defend captured positions
-    if (role === ROLE_VANGUARD) {
-      const captured = allFlags.filter(f => f.my === true && f !== myFlag);
-      if (captured.length > 0) return findClosestByRange(creep, captured);
-    }
-    return myFlag;
-  }
-
-  // Behind or tied → rush weakest-defended enemy flag
-  if (enemyFlags.length > 0) {
-    return enemyFlags.reduce((best, f) => {
-      const dBest = myCreeps.reduce((s, c) => s + getRange(c, best), 0);
-      const dF    = myCreeps.reduce((s, c) => s + getRange(c, f), 0);
-      return dF < dBest ? f : best;
-    });
-  }
-  if (neutralFlags.length > 0) return findClosestByRange(creep, neutralFlags);
-  return myFlag;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -716,151 +649,100 @@ function behaviorCharger(creep) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  11 · BEHAVIOR — Vanguard (Melee DPS + Flag Capture)
+//  11 · COMBAT ACTION — Decoupled from movement (fills the ATTACK/HEAL slot)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function behaviorVanguard(creep) {
-  // L5 — Emergency retreat
-  if (shouldRetreat(creep)) { executeRetreat(creep); recordAction(creep, 'move'); return; }
+/**
+ * Executes the creep's combat action this tick.
+ * NEVER calls moveTo() or move(). Returns action type or null.
+ * Runs for every creep including chargers (they can fight while fetching energy).
+ */
+function doCombatAction(creep) {
+  const role = creepRoles.get(creep.id);
 
-  // L4/L3 — Melee combat: attack adjacent enemies
-  const adj = findInRange(creep, enemies, 1);
-  if (adj.length > 0) {
-    const target = selectFocusTarget(creep, adj);
-    if (target) {
-      creep.attack(target);
-      creep.moveTo(target); // chase the target
-      recordAction(creep, 'attack');
-    }
-    return;
-  }
-
-  // Charge nearby enemies (2–5 range)
-  const nearby = findInRange(creep, enemies, 5);
-  if (nearby.length > 0) {
-    const target = selectFocusTarget(creep, nearby);
-    if (target) {
-      creep.moveTo(target, pathOpts());
-      // Ranged attack while closing if available
-      if (hasActive(creep, RANGED_ATTACK)) {
-        const inR3 = findInRange(creep, enemies, 3);
-        if (inR3.length >= 3) {
-          creep.rangedMassAttack();
-        } else if (inR3.length > 0) {
-          creep.rangedAttack(selectFocusTarget(creep, inR3) || inR3[0]);
-        }
-      }
-      recordAction(creep, 'attack');
-      return;
-    }
-  }
-
-  // L1 — BodyPart pickup
-  if (tryPickupBodyPart(creep)) { recordAction(creep, 'move'); return; }
-
-  // L2 — Advance toward objective (soft cohesion: don't outrun medics)
-  const obj = getObjective(creep, ROLE_VANGUARD);
-  if (obj) {
-    const medics = myCreeps.filter(c => creepRoles.get(c.id) === ROLE_MEDIC);
-    const nearestMedic = medics.length > 0 ? findClosestByRange(creep, medics) : null;
-    if (!nearestMedic || getRange(creep, nearestMedic) <= 7) {
-      creep.moveTo(obj, pathOpts());
-    }
-    // If medics are far behind (> 7) hold position one tick so they catch up
-    recordAction(creep, 'move');
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  11 · BEHAVIOR — Ranger (Ranged DPS + Kiting Micro)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-function behaviorRanger(creep) {
-  // L5 — Emergency retreat
-  if (shouldRetreat(creep)) { executeRetreat(creep); recordAction(creep, 'move'); return; }
-
-  const inR1 = findInRange(creep, enemies, 1);
-  const inR2 = findInRange(creep, enemies, 2);
-  const inR3 = findInRange(creep, enemies, 3);
-
-  // L4 — Kiting: flee if enemy within range 2 to maintain ideal range 3
-  if (inR1.length > 0 || inR2.length > 0) {
-    const threats = inR1.length > 0 ? inR1 : inR2;
-    const result = searchPath(
-      creep,
-      threats.map(e => ({ pos: e, range: KITE_FLEE_RANGE })),
-      pathOpts(true),
-    );
-    if (result.path.length > 0) {
-      const nx = result.path[0];
-      creep.move(getDirection(nx.x - creep.x, nx.y - creep.y));
-    }
-    if (inR3.length >= 3) {
-      creep.rangedMassAttack();
-    } else {
-      const t = selectFocusTarget(creep, threats);
-      if (t) creep.rangedAttack(t);
-    }
-    recordAction(creep, 'attack');
-    return;
-  }
-
-  // L3 — Optimal range: hold + fire
-  if (inR3.length > 0) {
-    if (inR3.length >= 3) {
-      creep.rangedMassAttack();
-    } else {
-      const t = selectFocusTarget(creep, inR3);
-      if (t) creep.rangedAttack(t);
-    }
-    // Maintain distance ≥ 3 from nearest enemy
-    const nearest = findClosestByRange(creep, inR3);
-    if (nearest && creep.getRangeTo(nearest) < 3) {
-      const result = searchPath(
-        creep,
-        [{ pos: nearest, range: KITE_FLEE_RANGE }],
-        pathOpts(true),
-      );
-      if (result.path.length > 0) {
-        const nx = result.path[0];
-        creep.move(getDirection(nx.x - creep.x, nx.y - creep.y));
-      }
-    }
-    recordAction(creep, 'attack');
-    return;
-  }
-
-  // L1 — BodyPart pickup
-  if (tryPickupBodyPart(creep)) { recordAction(creep, 'move'); return; }
-
-  // L2 — Advance: close to firing range (≤ 3) or push objective
-  if (enemies.length > 0) {
-    const nearestEnemy = findClosestByRange(creep, enemies);
-    if (nearestEnemy && getRange(creep, nearestEnemy) > 3) {
-      creep.moveTo(nearestEnemy, pathOpts());
-      recordAction(creep, 'move');
-      return;
-    }
-  }
-  const phase = getPhase();
-  if (phase === 4 && myFlagCount() > enemyFlagCount() && myFlag) {
-    creep.moveTo(myFlag, pathOpts());
-  } else {
-    const obj = getObjective(creep, ROLE_RANGER);
-    if (obj) creep.moveTo(obj, pathOpts());
-  }
-  recordAction(creep, 'move');
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  12 · BEHAVIOR — Medic (Triage Healing Protocol)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-function behaviorMedic(creep) {
-  // L5 — Self-preservation: self-heal + flee
+  // Retreating: highest priority — self-heal or shoot while fleeing
   if (shouldRetreat(creep)) {
-    if (hasActive(creep, HEAL)) creep.heal(creep);
-    const nearby = findInRange(creep, enemies, 6);
+    if (hasActive(creep, HEAL)) { creep.heal(creep); return 'heal'; }
+    if (hasActive(creep, RANGED_ATTACK)) {
+      const inR3 = findInRange(creep, enemies, 3);
+      if (inR3.length >= 3) { creep.rangedMassAttack(); return 'attack'; }
+      if (inR3.length > 0) {
+        const t = selectFocusTarget(creep, inR3);
+        if (t) { creep.rangedAttack(t); return 'attack'; }
+      }
+    }
+    return null;
+  }
+
+  if (role === ROLE_MEDIC) {
+    // Medics: healing always beats attacking
+    if (hasActive(creep, HEAL)) {
+      const damaged = myCreeps.filter(c => c.hits < c.hitsMax && c.id !== creep.id);
+      const adjDmg  = findInRange(creep, damaged, 1);
+      const nearDmg = findInRange(creep, damaged, 3);
+      if (adjDmg.length > 0) {
+        const t = adjDmg.reduce((b, c) => c.hits < b.hits ? c : b);
+        creep.heal(t); return 'heal';
+      }
+      if (nearDmg.length > 0) {
+        const t = nearDmg.reduce((b, c) => c.hits < b.hits ? c : b);
+        creep.rangedHeal(t); return 'heal';
+      }
+      if (creep.hits < creep.hitsMax) { creep.heal(creep); return 'heal'; }
+    }
+    // Nothing to heal → attack adjacent enemy
+    if (hasActive(creep, ATTACK)) {
+      const adj = findInRange(creep, enemies, 1);
+      if (adj.length > 0) {
+        const t = selectFocusTarget(creep, adj);
+        if (t) { creep.attack(t); return 'attack'; }
+      }
+    }
+    return null;
+  }
+
+  // Combat roles (vanguard, ranger, sentinel): melee > ranged > self-heal
+  if (hasActive(creep, ATTACK)) {
+    const adj = findInRange(creep, enemies, 1);
+    if (adj.length > 0) {
+      const t = selectFocusTarget(creep, adj);
+      if (t) { creep.attack(t); return 'attack'; }
+    }
+  }
+  if (hasActive(creep, RANGED_ATTACK)) {
+    const inR3 = findInRange(creep, enemies, 3);
+    if (inR3.length > 0) {
+      if (inR3.length >= 3) { creep.rangedMassAttack(); return 'attack'; }
+      const t = selectFocusTarget(creep, inR3);
+      if (t) { creep.rangedAttack(t); return 'attack'; }
+    }
+  }
+  // Opportunistic: heal an adjacent ally or self if idle
+  if (hasActive(creep, HEAL)) {
+    const damaged = myCreeps.filter(c => c.hits < c.hitsMax);
+    const adj = findInRange(creep, damaged, 1);
+    if (adj.length > 0) { creep.heal(adj.reduce((b, c) => c.hits < b.hits ? c : b)); return 'heal'; }
+    if (creep.hits < creep.hitsMax) { creep.heal(creep); return 'heal'; }
+  }
+  return null;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  12 · MOVE ACTION — Priority stack (fills the MOVE slot)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Executes the creep's movement this tick.
+ * NEVER calls attack(), heal(), rangedAttack(), or rangedHeal().
+ * Strictly ordered priority stack — first matching rule wins.
+ * A creep ALWAYS moves (static = bug). Formation is a soft pull, never a block.
+ */
+function doMoveAction(creep) {
+  const role = creepRoles.get(creep.id);
+
+  // P0: Emergency retreat — always wins
+  if (shouldRetreat(creep)) {
+    const nearby = findInRange(creep, enemies, 8);
     if (nearby.length > 0) {
       const result = searchPath(
         creep,
@@ -868,127 +750,123 @@ function behaviorMedic(creep) {
         pathOpts(true),
       );
       if (result.path.length > 0) {
-        const nx = result.path[0];
-        creep.move(getDirection(nx.x - creep.x, nx.y - creep.y));
-      }
-    } else if (myFlag) {
-      creep.moveTo(myFlag);
-    }
-    recordAction(creep, 'move');
-    return;
-  }
-
-  // L3 — Triage: find best heal target
-  const damaged = myCreeps.filter(c => c.id !== creep.id && c.hits < c.hitsMax);
-
-  if (damaged.length > 0) {
-    const scored = damaged.map(ally => {
-      const dmgPct    = (1 - ally.hits / ally.hitsMax) * 100;
-      const role      = creepRoles.get(ally.id);
-      const roleBonus = (role === ROLE_VANGUARD || role === ROLE_SENTINEL) ? 20 : 0;
-      const dist      = creep.getRangeTo(ally);
-      const adjBonus  = dist <= 1 ? 10 : 0;
-      return { ally, score: dmgPct + roleBonus + adjBonus, dist };
-    });
-    scored.sort((a, b) => b.score - a.score);
-    const best = scored[0];
-
-    if (best.dist <= 1) {
-      creep.heal(best.ally);
-      creep.moveTo(best.ally);
-    } else if (best.dist <= 3) {
-      creep.rangedHeal(best.ally);
-      creep.moveTo(best.ally);
-    } else {
-      creep.moveTo(best.ally, pathOpts());
-      // Opportunistic heal on another nearby ally while walking
-      const adjAllies  = findInRange(creep, damaged, 1);
-      const nearAllies = findInRange(creep, damaged, 3);
-      if (adjAllies.length > 0) {
-        creep.heal(adjAllies[0]);
-      } else if (nearAllies.length > 0) {
-        creep.rangedHeal(nearAllies[0]);
+        creep.move(getDirection(result.path[0].x - creep.x, result.path[0].y - creep.y));
+        return;
       }
     }
-    recordAction(creep, 'heal');
+    if (myFlag) creep.moveTo(myFlag, pathOpts());
     return;
   }
 
-  // Self-heal if hurt
-  if (creep.hits < creep.hitsMax && hasActive(creep, HEAL)) {
-    creep.heal(creep);
-    recordAction(creep, 'heal');
-    return;
-  }
+  // P1: Body part on same tile — auto-collecting, no move needed
+  if (bodyParts.some(b => b.x === creep.x && b.y === creep.y)) return;
 
-  // L1 — BodyPart pickup
-  if (tryPickupBodyPart(creep)) { recordAction(creep, 'move'); return; }
-
-  // L0 — Follow squad centroid to stay within healing range (deathball cohesion)
-  const centroid = squadCentroid();
-  if (centroid && getRange(creep, centroid) > 3) {
-    creep.moveTo(centroid, pathOpts());
-  } else {
-    // Already near centroid — close gap to nearest combatant
-    const combatants = myCreeps.filter(c => {
-      const r = creepRoles.get(c.id);
-      return r === ROLE_VANGUARD || r === ROLE_RANGER || r === ROLE_SENTINEL;
-    });
-    const nearest = combatants.length > 0 ? findClosestByRange(creep, combatants) : null;
-    if (nearest && getRange(creep, nearest) > 3) {
-      creep.moveTo(nearest, pathOpts());
+  // P2: Body part within range 1 — micro-divert (zero cost since we're adjacent)
+  if (bodyParts.length > 0) {
+    const adj = findInRange(creep, bodyParts, 1);
+    if (adj.length > 0) {
+      const prio = { [HEAL]: 4, [ATTACK]: 3, [RANGED_ATTACK]: 2, [MOVE]: 1 };
+      adj.sort((a, b) => (prio[b.type] || 0) - (prio[a.type] || 0));
+      creep.moveTo(adj[0]);
+      return;
     }
   }
-  recordAction(creep, 'move');
+
+  // P3: Role-specific local movement
+  if (role === ROLE_MEDIC) {
+    // Chase most-damaged ally (healing movement)
+    const damaged = myCreeps.filter(c => c.hits < c.hitsMax && c.id !== creep.id);
+    if (damaged.length > 0) {
+      const best = damaged.reduce((b, c) => (c.hits / c.hitsMax) < (b.hits / b.hitsMax) ? c : b);
+      if (getRange(creep, best) > 1) { creep.moveTo(best, pathOpts()); return; }
+    }
+    // No one damaged: follow squad centroid (soft cohesion — never blocks)
+    const centroid = squadCentroid();
+    if (centroid && getRange(creep, centroid) > 3) {
+      creep.moveTo(centroid, pathOpts()); return;
+    }
+    // Near centroid: advance with squad to commander target
+    const obj = creepTargets.get(creep.id);
+    if (obj) creep.moveTo(obj, pathOpts());
+    return;
+  }
+
+  if (role === ROLE_RANGER) {
+    // Kite: if enemy within range 2, flee to maintain ideal firing range 3
+    const inR2 = findInRange(creep, enemies, 2);
+    if (inR2.length > 0) {
+      const result = searchPath(
+        creep,
+        inR2.map(e => ({ pos: e, range: KITE_FLEE_RANGE })),
+        pathOpts(true),
+      );
+      if (result.path.length > 0) {
+        creep.move(getDirection(result.path[0].x - creep.x, result.path[0].y - creep.y));
+      }
+      return;
+    }
+    // Advance toward nearest enemy until firing range reached
+    if (enemies.length > 0) {
+      const nearest = findClosestByRange(creep, enemies);
+      if (nearest && getRange(creep, nearest) > 3) {
+        creep.moveTo(nearest, pathOpts()); return;
+      }
+    }
+    // In range or no enemies: advance to commander target
+    const obj = creepTargets.get(creep.id);
+    if (obj) creep.moveTo(obj, pathOpts());
+    return;
+  }
+
+  if (role === ROLE_SENTINEL) {
+    // Intercept flag threats first
+    const threats = myFlag ? findInRange(myFlag, enemies, 8) : [];
+    if (threats.length > 0) {
+      const t = selectFocusTarget(creep, threats);
+      if (t) { creep.moveTo(t, pathOpts()); return; }
+    }
+    // Patrol near flag
+    if (myFlag && getRange(creep, myFlag) > SENTINEL_PATROL_RANGE) {
+      creep.moveTo(myFlag, pathOpts());
+    }
+    return;
+  }
+
+  // VANGUARD (and undefined/fallback): chase nearest enemy in combat range, else advance
+  const nearEnemies = findInRange(creep, enemies, 5);
+  if (nearEnemies.length > 0) {
+    const t = selectFocusTarget(creep, nearEnemies);
+    if (t) { creep.moveTo(t, pathOpts()); return; }
+  }
+  const obj = creepTargets.get(creep.id);
+  if (obj) creep.moveTo(obj, pathOpts());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  15 · BEHAVIOR — Sentinel (Home Flag Defense)
+//  13 · TICK EXECUTOR — Decoupled combat + movement, no conflicts
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function behaviorSentinel(creep) {
-  if (!myFlag) { behaviorVanguard(creep); return; }
+/**
+ * Per-creep execution: fills COMBAT SLOT and MOVE SLOT independently.
+ * These two slots NEVER interfere — Screeps allows both per tick.
+ * Chargers use behaviorCharger for movement but still fight via doCombatAction.
+ */
+function executeTick(creep) {
+  const combatAct = doCombatAction(creep); // COMBAT SLOT (always)
 
-  const selfDamaged = creep.hits < creep.hitsMax;
-
-  // Enemies threatening our flag
-  const threatsNearFlag = findInRange(myFlag, enemies, 8);
-  const adj  = findInRange(creep, enemies, 1);
-  const inR3 = findInRange(creep, enemies, 3);
-
-  let actionTaken = false;
-
-  // Prefer melee if adjacent
-  if (adj.length > 0 && hasActive(creep, ATTACK)) {
-    const target = selectFocusTarget(creep, adj);
-    if (target) { creep.attack(target); actionTaken = true; }
-  }
-  // Ranged if not in melee
-  if (!actionTaken && inR3.length > 0 && hasActive(creep, RANGED_ATTACK)) {
-    if (inR3.length >= 3) {
-      creep.rangedMassAttack();
-      actionTaken = true;
-    } else {
-      const target = selectFocusTarget(creep, inR3);
-      if (target) { creep.rangedAttack(target); actionTaken = true; }
-    }
-  }
-  // Self-heal if no combat action
-  if (!actionTaken && selfDamaged && hasActive(creep, HEAL)) {
-    creep.heal(creep);
-    actionTaken = true;
+  if (chargerToTower.has(creep.id)) {
+    // Charger movement managed by behaviorCharger (includes its own recordAction)
+    behaviorCharger(creep);
+    if (combatAct) recordAction(creep, combatAct); // override to reflect combat
+    return;
   }
 
-  // Movement: intercept threats or patrol near flag
-  if (threatsNearFlag.length > 0) {
-    const closest = findClosestByRange(creep, threatsNearFlag);
-    if (closest) creep.moveTo(closest, pathOpts());
-  } else if (creep.getRangeTo(myFlag) > SENTINEL_PATROL_RANGE) {
-    creep.moveTo(myFlag, pathOpts());
-  }
-
-  recordAction(creep, actionTaken ? 'attack' : 'move');
+  doMoveAction(creep);                      // MOVE SLOT (always)
+  recordAction(creep, combatAct || 'move');
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  16 · TOWER CONTROLLER
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  16 · TOWER CONTROLLER
@@ -1182,21 +1060,13 @@ export function loop() {
   // ─── ASSIGN TOWER CHARGERS (one per hungry tower) ────────
   assignTowerChargers();
 
+  // ─── COMMANDER LAYER — global objective assignment ────────
+  commandLayer();
+
   // ─── CREEP ACTIONS ──────────────────────────────────────
   for (const creep of myCreeps) {
     if (creep.spawning) continue;
-    // Explicitly assigned tower chargers run their own behavior
-    if (chargerToTower.has(creep.id)) { behaviorCharger(creep); continue; }
-
-    const role = creepRoles.get(creep.id);
-
-    switch (role) {
-      case ROLE_VANGUARD:  behaviorVanguard(creep);  break;
-      case ROLE_RANGER:    behaviorRanger(creep);    break;
-      case ROLE_MEDIC:     behaviorMedic(creep);     break;
-      case ROLE_SENTINEL:  behaviorSentinel(creep);  break;
-      default:             behaviorVanguard(creep);  break;
-    }
+    executeTick(creep);
   }
 
   // ─── DIAGNOSTICS ────────────────────────────────────────
