@@ -62,6 +62,9 @@ const ROLE_SENTINEL  = 'sentinel';
 
 // ─── CONFIGURATION ──────────────────────────────────────────────────────────
 const RETREAT_HP_RATIO         = 0.30;
+// HP ratio at which a non-medic creep pulls back to the nearest medic for heals.
+// Above RETREAT threshold but below this ratio → soft pull-back (not full flee).
+const PULLBACK_HP_RATIO        = 0.65;
 const INFLUENCE_REFRESH_TICKS  = 3;
 const ROLE_REEVAL_TICKS        = 30;
 const BODYPART_DEVIATE_RANGE   = 3;
@@ -92,6 +95,9 @@ const towerChargeAssigned = new Map();  // towerId → chargerCreepId
 const chargerToTower      = new Map();  // chargerCreepId → towerId
 const chargerState        = new Map();  // chargerCreepId → 'WITHDRAW'|'DELIVER'
 const creepTargets        = new Map();  // creepId → target {x,y} set by commandLayer each tick
+// ONE shared focus target computed by commandLayer — all attackers prefer this enemy.
+// Concentrates burst damage to break through enemy heals.
+let globalFocusTarget  = null;
 let influenceMatrix    = null;
 let lastInfluenceTick  = -Infinity;
 let initialized        = false;
@@ -450,6 +456,21 @@ function shouldRetreat(creep) {
   return creep.hits < creep.hitsMax * RETREAT_HP_RATIO;
 }
 
+/**
+ * Soft pull-back: front-line creep is moderately damaged and has no medic cover.
+ * The creep steps toward the nearest medic to receive heals, then re-engages.
+ * This is NOT a full retreat — the creep still fights while moving.
+ */
+function shouldPullBack(creep) {
+  if (shouldRetreat(creep)) return false;                          // full retreat handles this
+  const role = creepRoles.get(creep.id);
+  if (role === ROLE_MEDIC || role === ROLE_SENTINEL) return false; // medics don't pull back
+  const ratio = creep.hits / creep.hitsMax;
+  if (ratio > PULLBACK_HP_RATIO) return false;                     // still healthy
+  // Suppress pull-back if a medic is already adjacent (healing happening)
+  return !myCreeps.some(c => creepRoles.get(c.id) === ROLE_MEDIC && getRange(creep, c) <= 1);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  9 · COMMANDER LAYER — Global target assignment (runs once per tick)
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -475,6 +496,16 @@ function commandLayer() {
     if (chargerToTower.has(creep.id)) continue; // charger has its own target
     const role = creepRoles.get(creep.id);
     creepTargets.set(creep.id, role === ROLE_SENTINEL ? (myFlag || objective) : objective);
+  }
+
+  // ── Global focus target: ONE enemy for all attackers to concentrate on ──────
+  // Computed from the squad centroid so we pick an enemy reachable by the group,
+  // not just the one closest to a single creep.
+  // Priority matches selectFocusTarget: kill-secured → healers → lowest HP.
+  if (enemies.length > 0) {
+    globalFocusTarget = selectFocusTarget({ x: 50, y: 50 }, enemies);
+  } else {
+    globalFocusTarget = null;
   }
 }
 
@@ -708,7 +739,10 @@ function doCombatAction(creep) {
   if (hasActive(creep, ATTACK)) {
     const adj = findInRange(creep, enemies, 1);
     if (adj.length > 0) {
-      const t = selectFocusTarget(creep, adj);
+      // Prefer the global shared focus target to burst through enemy heals
+      const t = (globalFocusTarget && adj.some(e => e.id === globalFocusTarget.id))
+        ? globalFocusTarget
+        : selectFocusTarget(creep, adj);
       if (t) { creep.attack(t); return 'attack'; }
     }
   }
@@ -716,7 +750,10 @@ function doCombatAction(creep) {
     const inR3 = findInRange(creep, enemies, 3);
     if (inR3.length > 0) {
       if (inR3.length >= 3) { creep.rangedMassAttack(); return 'attack'; }
-      const t = selectFocusTarget(creep, inR3);
+      // Prefer global focus target; fall back to individual selection
+      const t = (globalFocusTarget && inR3.some(e => e.id === globalFocusTarget.id))
+        ? globalFocusTarget
+        : selectFocusTarget(creep, inR3);
       if (t) { creep.rangedAttack(t); return 'attack'; }
     }
   }
@@ -761,6 +798,20 @@ function doMoveAction(creep) {
     return;
   }
 
+  // P0.5: Pull-back — moderately damaged, no adjacent medic → step toward nearest medic.
+  // The creep still fires via doCombatAction (combat slot is independent).
+  // Once a medic is adjacent (and thus healing), pull-back condition clears.
+  if (shouldPullBack(creep)) {
+    const medics = myCreeps.filter(c => creepRoles.get(c.id) === ROLE_MEDIC);
+    if (medics.length > 0) {
+      const nearest = findClosestByRange(creep, medics);
+      if (nearest && getRange(creep, nearest) > 1) {
+        creep.moveTo(nearest, pathOpts());
+        return;
+      }
+    }
+  }
+
   // P1: Body part on same tile — auto-collecting, no move needed
   if (bodyParts.some(b => b.x === creep.x && b.y === creep.y)) return;
 
@@ -796,13 +847,45 @@ function doMoveAction(creep) {
 
   // P3: Role-specific local movement
   if (role === ROLE_MEDIC) {
-    // Chase most-damaged ally (healing movement)
-    const damaged = myCreeps.filter(c => c.hits < c.hitsMax && c.id !== creep.id);
-    if (damaged.length > 0) {
-      const best = damaged.reduce((b, c) => (c.hits / c.hitsMax) < (b.hits / b.hitsMax) ? c : b);
-      if (getRange(creep, best) > 1) { creep.moveTo(best, pathOpts()); return; }
+    const frontline = myCreeps.filter(c => {
+      const r = creepRoles.get(c.id);
+      return r !== ROLE_MEDIC && c.id !== creep.id;
+    });
+
+    // P3-M1: Creep pulling back (damaged, needs heals) → intercept at high priority
+    const pullingBack = frontline.filter(c => shouldPullBack(c));
+    if (pullingBack.length > 0) {
+      const worst = pullingBack.reduce((b, c) => (c.hits / c.hitsMax) < (b.hits / b.hitsMax) ? c : b);
+      if (getRange(creep, worst) > 1) { creep.moveTo(worst, pathOpts()); return; }
+      // Already adjacent: stay put (heal fires via doCombatAction)
+      return;
     }
-    // No one damaged: follow squad centroid (soft cohesion — never blocks)
+
+    // P3-M2: Any ally damaged → chase most-damaged (classic healer behaviour)
+    const damaged = frontline.filter(c => c.hits < c.hitsMax);
+    if (damaged.length > 0) {
+      const worst = damaged.reduce((b, c) => (c.hits / c.hitsMax) < (b.hits / b.hitsMax) ? c : b);
+      if (getRange(creep, worst) > 1) { creep.moveTo(worst, pathOpts()); return; }
+      return;
+    }
+
+    // P3-M3: Everyone healthy → escort the most-forward ally (closest to enemy cluster).
+    // Stay within range 2 so heals can fire the moment damage lands.
+    // The medic shadows the advance without leading it.
+    if (frontline.length > 0 && enemies.length > 0) {
+      const enemyCentroid = enemies.reduce(
+        (acc, e) => ({ x: acc.x + e.x / enemies.length, y: acc.y + e.y / enemies.length }),
+        { x: 0, y: 0 }
+      );
+      const escort = frontline.reduce((b, c) =>
+        getRange(c, enemyCentroid) < getRange(b, enemyCentroid) ? c : b
+      );
+      const targetDist = getRange(creep, escort);
+      if (targetDist > 2) { creep.moveTo(escort, pathOpts()); return; }
+      // Close enough: hold position or drift with squad centroid
+    }
+
+    // P3-M4: Fallback — follow squad centroid
     const centroid = squadCentroid();
     if (centroid && getRange(creep, centroid) > 3) {
       creep.moveTo(centroid, pathOpts()); return;
