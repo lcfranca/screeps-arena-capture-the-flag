@@ -24,7 +24,13 @@ import {
   Flag,
   StructureTower,
   StructureContainer,
+  StructureSpawn,
+  StructureExtension,
+  Source,
 } from 'game/prototypes';
+
+import { arenaInfo } from 'game';
+import { Visual } from 'game/visual';
 
 import {
   ATTACK,
@@ -54,6 +60,7 @@ const ROLE_RANGER    = 'ranger';
 const ROLE_MEDIC     = 'medic';
 const ROLE_LOGISTICS = 'logistics';
 const ROLE_SENTINEL  = 'sentinel';
+const ROLE_FARMER    = 'farmer';
 
 // ─── CONFIGURATION ──────────────────────────────────────────────────────────
 const RETREAT_HP_RATIO         = 0.30;
@@ -72,13 +79,42 @@ const PHASE_CONSOLIDATE   = 500;
 const PHASE_ASSAULT_END   = 1500;
 const TICK_LIMIT           = 2000;
 
+// ─── SPAWN CONFIGURATION ─────────────────────────────────────────────────────
+// Energy costs: MOVE=50, CARRY=50, WORK=100, ATTACK=80, RANGED_ATTACK=150,
+//               HEAL=250, TOUGH=10
+const SPAWN_BODIES = {
+  fighter:  [TOUGH, ATTACK, ATTACK, MOVE, MOVE],          // 220 energy, fast melee
+  ranger:   [TOUGH, RANGED_ATTACK, MOVE, MOVE],            // 260 energy, ranged
+  medic:    [HEAL, MOVE, MOVE],                            // 350 energy
+  farmer:   [WORK, CARRY, MOVE],                           // 200 energy
+};
+// Minimum roster sizes before spawning more of a type:
+const MIN_FIGHTERS  = 4;
+const MIN_MEDICS    = 1;
+const MIN_FARMERS   = 1;
+const SPAWN_ENERGY_RESERVE = 150; // keep a buffer before spawning
+
 // ─── PERSISTENT STATE (survives across ticks) ────────────────────────────────
 const creepRoles       = new Map();   // id → role string
 const logisticsState   = new Map();   // id → 'WITHDRAW' | 'DELIVER'
 const logisticsTower   = new Map();   // id → tower id
+const farmerState      = new Map();   // id → 'HARVEST' | 'DEPOSIT'
 let influenceMatrix    = null;
 let lastInfluenceTick  = -Infinity;
 let initialized        = false;
+
+// ─── DIAGNOSTIC / METRICS STATE ────────────────────────────────────────────────
+const diag = {
+  startRoster:      null,    // snapshot of initial role counts
+  spawnEvents:      [],      // {tick, body, role}
+  deathEvents:      [],      // {tick, role, hp}
+  flagEvents:       [],      // {tick, type:'capture'|'lose', flag}
+  actionCounts:     {},      // role → {move,attack,heal,harvest,idle}
+  cpuSamples:       [],      // ns per tick
+  idleTicks:        {},      // creep.id → count of idle ticks
+  lastFlagSnapshot: null,    // previous tick's flag my/enemy counts
+  gameDumped:       false,
+};
 
 // ─── PER-TICK WORLD STATE (refreshed every tick) ─────────────────────────────
 let myCreeps      = [];
@@ -92,7 +128,12 @@ let myTowers      = [];
 let enemyTowers   = [];
 let containers    = [];
 let bodyParts     = [];
+let mySpawns      = [];  // my StructureSpawn instances
+let allSources    = [];  // Source instances (energy wells)
+let myExtensions  = [];  // my StructureExtension instances
 let tick          = 0;
+// per-tick action tracking (for idle detection)
+const tickActions = new Map(); // creep.id → action string this tick
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  1 · SENSE LAYER — World State Refresh
@@ -100,21 +141,53 @@ let tick          = 0;
 
 function refreshWorldState() {
   tick = getTicks();
+  tickActions.clear();
 
+  // ── Creeps ────────────────────────────────────────────
   const allCreeps = getObjectsByPrototype(Creep);
+  const prevMyIds = new Set(myCreeps.map(c => c.id));
   myCreeps = allCreeps.filter(c => c.my);
   enemies  = allCreeps.filter(c => !c.my);
 
+  // Death detection: creeps that vanished since last tick
+  const aliveIds = new Set(myCreeps.map(c => c.id));
+  for (const id of prevMyIds) {
+    if (!aliveIds.has(id)) {
+      const role = creepRoles.get(id) || 'unknown';
+      diag.deathEvents.push({ tick, id, role });
+      creepRoles.delete(id);
+      logisticsState.delete(id);
+      logisticsTower.delete(id);
+      farmerState.delete(id);
+    }
+  }
+
+  // ── Flags ─────────────────────────────────────────────
   allFlags     = getObjectsByPrototype(Flag);
   myFlag       = allFlags.find(f => f.my === true) || null;
   enemyFlags   = allFlags.filter(f => f.my === false);
   neutralFlags = allFlags.filter(f => f.my === undefined);
 
-  allTowers   = getObjectsByPrototype(StructureTower);
-  myTowers    = allTowers.filter(t => t.my === true);
-  enemyTowers = allTowers.filter(t => t.my === false);
+  // Flag capture/loss detection
+  const curMy  = allFlags.filter(f => f.my === true).length;
+  const curEn  = allFlags.filter(f => f.my === false).length;
+  if (diag.lastFlagSnapshot) {
+    const { my: prevMy, enemy: prevEn } = diag.lastFlagSnapshot;
+    if (curMy > prevMy)  diag.flagEvents.push({ tick, type: 'capture', myCount: curMy });
+    if (curMy < prevMy)  diag.flagEvents.push({ tick, type: 'lose',    myCount: curMy });
+    if (curEn > prevEn)  diag.flagEvents.push({ tick, type: 'enemy_captured', enemyCount: curEn });
+  }
+  diag.lastFlagSnapshot = { my: curMy, enemy: curEn };
 
-  containers = getObjectsByPrototype(StructureContainer);
+  // ── Structures ────────────────────────────────────────
+  allTowers    = getObjectsByPrototype(StructureTower);
+  myTowers     = allTowers.filter(t => t.my === true);
+  enemyTowers  = allTowers.filter(t => t.my === false);
+  containers   = getObjectsByPrototype(StructureContainer);
+  mySpawns     = getObjectsByPrototype(StructureSpawn).filter(s => s.my);
+  myExtensions = getObjectsByPrototype(StructureExtension).filter(e => e.my);
+  allSources   = getObjectsByPrototype(Source).filter(s => s.energy > 0);
+
   bodyParts  = getObjectsByPrototype(BodyPart);
 }
 
@@ -145,9 +218,11 @@ function classifyCreep(creep) {
   const c = countParts(creep, CARRY);
   const w = countParts(creep, WORK);
 
-  // Logistics: has CARRY, optionally WORK, no offensive parts
-  if (c > 0 && a === 0 && r === 0 && h === 0) return ROLE_LOGISTICS;
-  if (c > 0 && w > 0 && a === 0 && r === 0) return ROLE_LOGISTICS;
+  // Farmer: WORK + CARRY, no offensive/heal parts → harvests sources for spawn
+  if (w > 0 && c > 0 && a === 0 && r === 0 && h === 0) return ROLE_FARMER;
+
+  // Logistics: has CARRY (no WORK), no offensive parts → tower charging only
+  if (c > 0 && w === 0 && a === 0 && r === 0 && h === 0) return ROLE_LOGISTICS;
 
   // Medic: primarily HEAL
   if (h > 0 && h >= a && h >= r) return ROLE_MEDIC;
@@ -169,13 +244,22 @@ function classifyCreep(creep) {
 function assignRoles() {
   const counts = {
     [ROLE_VANGUARD]: 0, [ROLE_RANGER]: 0, [ROLE_MEDIC]: 0,
-    [ROLE_LOGISTICS]: 0, [ROLE_SENTINEL]: 0,
+    [ROLE_LOGISTICS]: 0, [ROLE_SENTINEL]: 0, [ROLE_FARMER]: 0,
   };
 
   for (const creep of myCreeps) {
     const role = classifyCreep(creep);
     creepRoles.set(creep.id, role);
     counts[role]++;
+  }
+
+  // Snapshot initial roster for diagnostics
+  if (!diag.startRoster) {
+    diag.startRoster = { ...counts, total: myCreeps.length };
+    for (const role of Object.keys(counts)) {
+      diag.actionCounts[role] = { move: 0, attack: 0, heal: 0, harvest: 0, idle: 0 };
+    }
+    console.log(`[INIT T${tick}] Roster: ${JSON.stringify(diag.startRoster)}`);
   }
 
   // Promote 1 vanguard to sentinel for home flag defense
@@ -235,6 +319,16 @@ function reevaluateRoles() {
       creepRoles.delete(id);
       logisticsState.delete(id);
       logisticsTower.delete(id);
+      farmerState.delete(id);
+    }
+  }
+
+  // Assign roles to newly-spawned creeps (not yet in creepRoles)
+  for (const creep of myCreeps) {
+    if (!creep.spawning && !creepRoles.has(creep.id)) {
+      const role = classifyCreep(creep);
+      creepRoles.set(creep.id, role);
+      console.log(`[SPAWN-ROLE T${tick}] New creep ${creep.id.slice(-4)} → ${role}`);
     }
   }
 
@@ -510,6 +604,19 @@ function getObjective(creep, role) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+//  ACTION RECORDING HELPER
+// ═══════════════════════════════════════════════════════════════════════════════
+function recordAction(creep, action) {
+  tickActions.set(creep.id, action);
+  const role = creepRoles.get(creep.id) || 'unknown';
+  if (!diag.actionCounts[role]) {
+    diag.actionCounts[role] = { move: 0, attack: 0, heal: 0, harvest: 0, idle: 0 };
+  }
+  const key = (['move','attack','heal','harvest'].includes(action)) ? action : 'idle';
+  diag.actionCounts[role][key]++;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 //  10 · BEHAVIOR — Vanguard (Melee DPS + Flag Capture)
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -751,27 +858,116 @@ function behaviorLogistics(creep) {
 
   if (state === 'WITHDRAW') {
     if (fullContainers.length === 0) {
-      if (creep.getRangeTo(tower) > 3) creep.moveTo(tower);
+      // No containers with energy: if there's a source nearby, go harvest it directly
+      if (hasActive(creep, WORK) && allSources.length > 0) {
+        const src = findClosestByRange(creep, allSources);
+        if (src) {
+          if (creep.getRangeTo(src) <= 1) { creep.harvest(src); }
+          else { creep.moveTo(src, pathOpts()); }
+          recordAction(creep, 'harvest');
+          return;
+        }
+      }
+      // Otherwise: follow combat squad so we're not parked alone
+      const combatFriends = myCreeps.filter(c => {
+        const r = creepRoles.get(c.id);
+        return r === ROLE_VANGUARD || r === ROLE_RANGER;
+      });
+      if (combatFriends.length > 0) {
+        const nearest = findClosestByRange(creep, combatFriends);
+        if (nearest && creep.getRangeTo(nearest) > 2) {
+          creep.moveTo(nearest, pathOpts());
+          recordAction(creep, 'move');
+          return;
+        }
+      }
+      if (myFlag) creep.moveTo(myFlag, pathOpts());
+      recordAction(creep, 'idle');
       return;
     }
     const container = findClosestByRange(creep, fullContainers);
     if (creep.getRangeTo(container) <= 1) {
       creep.withdraw(container, RESOURCE_ENERGY);
+      recordAction(creep, 'harvest');
     } else {
       creep.moveTo(container, pathOpts());
+      recordAction(creep, 'move');
     }
   } else {
     // DELIVER
     if (creep.getRangeTo(tower) <= 1) {
       creep.transfer(tower, RESOURCE_ENERGY);
+      recordAction(creep, 'harvest'); // counts as productive resource action
     } else {
       creep.moveTo(tower, pathOpts());
+      recordAction(creep, 'move');
     }
   }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  14 · BEHAVIOR — Sentinel (Home Flag Defense)
+//  14b · BEHAVIOR — Farmer (Source Harvesting for Spawn Production)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function behaviorFarmer(creep) {
+  // L5 — retreat if critical
+  if (shouldRetreat(creep)) { executeRetreat(creep); return; }
+
+  const energy     = creep.store ? (creep.store.getUsedCapacity(RESOURCE_ENERGY) || 0) : 0;
+  const capacity   = creep.store ? (creep.store.getCapacity() || 0) : 0;
+  const free       = capacity - energy;
+  let   state      = farmerState.get(creep.id) || 'HARVEST';
+
+  // State transitions
+  if (state === 'HARVEST' && free <= 0)   { state = 'DEPOSIT'; farmerState.set(creep.id, state); }
+  if (state === 'DEPOSIT' && energy <= 0) { state = 'HARVEST'; farmerState.set(creep.id, state); }
+
+  if (state === 'HARVEST') {
+    // Find closest active source
+    const sources = getObjectsByPrototype(Source).filter(s => s.energy > 0);
+    if (sources.length === 0) {
+      // No energy in any source — wait near spawn
+      if (mySpawns.length > 0) creep.moveTo(mySpawns[0], pathOpts());
+      recordAction(creep, 'idle');
+      return;
+    }
+    const src = findClosestByRange(creep, sources);
+    if (creep.getRangeTo(src) <= 1) {
+      creep.harvest(src);
+      recordAction(creep, 'harvest');
+    } else {
+      creep.moveTo(src, pathOpts());
+      recordAction(creep, 'move');
+    }
+  } else {
+    // DEPOSIT: deliver to spawn first, then extensions, then containers
+    const depositTargets = [
+      ...mySpawns.filter(s => s.store && s.store.getFreeCapacity(RESOURCE_ENERGY) > 0),
+      ...myExtensions.filter(e => e.store && e.store.getFreeCapacity(RESOURCE_ENERGY) > 0),
+    ];
+    if (depositTargets.length === 0) {
+      // All full — drop near spawn so containers pick it up
+      if (mySpawns.length > 0 && creep.getRangeTo(mySpawns[0]) <= 1) {
+        creep.drop(RESOURCE_ENERGY);
+      } else if (mySpawns.length > 0) {
+        creep.moveTo(mySpawns[0], pathOpts());
+      }
+      recordAction(creep, 'move');
+      return;
+    }
+    const target = findClosestByRange(creep, depositTargets);
+    if (creep.getRangeTo(target) <= 1) {
+      creep.transfer(target, RESOURCE_ENERGY);
+      recordAction(creep, 'harvest');
+    } else {
+      creep.moveTo(target, pathOpts());
+      recordAction(creep, 'move');
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  15 · BEHAVIOR — Sentinel (Home Flag Defense)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 function behaviorSentinel(creep) {
@@ -864,7 +1060,189 @@ function tryPullChain(fast, slow, destination) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  17 · MAIN LOOP — Per-Tick Orchestrator
+//  17b · SPAWN CONTROLLER — Continuous Creep Production
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function spawnBodyCost(body) {
+  const COSTS = { [MOVE]: 50, [CARRY]: 50, [WORK]: 100, [ATTACK]: 80,
+                  [RANGED_ATTACK]: 150, [HEAL]: 250, [TOUGH]: 10 };
+  return body.reduce((s, p) => s + (COSTS[p] || 0), 0);
+}
+
+function totalSpawnEnergy() {
+  let total = 0;
+  for (const s of mySpawns)     total += s.store ? (s.store.getUsedCapacity(RESOURCE_ENERGY) || 0) : 0;
+  for (const e of myExtensions) total += e.store ? (e.store.getUsedCapacity(RESOURCE_ENERGY) || 0) : 0;
+  return total;
+}
+
+function countRole(role) {
+  let n = 0;
+  for (const r of creepRoles.values()) if (r === role) n++;
+  return n;
+}
+
+function spawnController() {
+  const freeSpawn = mySpawns.find(s => !s.spawning);
+  if (!freeSpawn) return; // all spawns busy
+
+  const availableEnergy = totalSpawnEnergy();
+  const phase = getPhase();
+
+  // Determine what to spawn based on need
+  let chosenBody = null;
+  let chosenRole = null;
+
+  const fighters  = countRole(ROLE_VANGUARD) + countRole(ROLE_RANGER);
+  const medics    = countRole(ROLE_MEDIC);
+  const farmers   = countRole(ROLE_FARMER);
+  const logistics = countRole(ROLE_LOGISTICS);
+
+  // Priority queue:
+  // 1. Always keep at least MIN_FARMERS farmers if sources exist
+  if (farmers < MIN_FARMERS && allSources.length > 0) {
+    chosenBody = SPAWN_BODIES.farmer;
+    chosenRole = 'farmer';
+  }
+  // 2. Always keep some fighters
+  else if (fighters < MIN_FIGHTERS && phase < 4) {
+    chosenBody = SPAWN_BODIES.fighter;
+    chosenRole = 'fighter';
+  }
+  // 3. Keep at least 1 medic if we have fighters
+  else if (medics < MIN_MEDICS && fighters >= 2) {
+    chosenBody = SPAWN_BODIES.medic;
+    chosenRole = 'medic';
+  }
+  // 4. Late game: mass fighters
+  else if (phase >= 3) {
+    chosenBody = SPAWN_BODIES.fighter;
+    chosenRole = 'fighter';
+  }
+  // 5. Otherwise: farmers for sustained economy
+  else {
+    chosenBody = SPAWN_BODIES.farmer;
+    chosenRole = 'farmer';
+  }
+
+  const cost = spawnBodyCost(chosenBody);
+  if (availableEnergy < cost + SPAWN_ENERGY_RESERVE) return; // not enough energy
+
+  const result = freeSpawn.spawnCreep(chosenBody);
+  if (result.object) {
+    console.log(`[SPAWN T${tick}] Spawning ${chosenRole} body=[${chosenBody.join(',')}] cost=${cost} energy=${availableEnergy}`);
+    diag.spawnEvents.push({ tick, body: chosenBody.join(','), role: chosenRole, cost });
+  } else if (result.error && result.error !== -6 /*ERR_NOT_ENOUGH_ENERGY*/) {
+    console.log(`[SPAWN-ERR T${tick}] error=${result.error} body=${chosenBody.join(',')}`);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  18 · DIAGNOSTICS & METRICS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const DIAG_INTERVAL = 100; // print compact log every N ticks
+
+// Compact per-interval summary
+function tickLog() {
+  if (tick % DIAG_INTERVAL !== 0 && tick !== 1) return;
+
+  const cpu = Math.round(getCpuTime() / 1e6); // ms
+  diag.cpuSamples.push(cpu);
+
+  const roles = {};
+  for (const r of creepRoles.values()) roles[r] = (roles[r] || 0) + 1;
+
+  const spawnE = totalSpawnEnergy();
+  const srcE   = allSources.reduce((s, src) => s + src.energy, 0);
+  const myF    = allFlags.filter(f => f.my === true).length;
+  const enF    = allFlags.filter(f => f.my === false).length;
+  const neuF   = allFlags.filter(f => f.my === undefined).length;
+
+  console.log(
+    `[T${tick}] CPU=${cpu}ms alive=${myCreeps.length} enemies=${enemies.length}` +
+    ` flags(my=${myF} en=${enF} neu=${neuF})` +
+    ` spawnE=${spawnE} srcE=${srcE}` +
+    ` roles=${JSON.stringify(roles)}`
+  );
+}
+
+// Detect creeps that had no recorded action this tick
+function detectAndLogIdle() {
+  for (const creep of myCreeps) {
+    if (creep.spawning) continue;
+    if (!tickActions.has(creep.id)) {
+      // behavior ran but didn’t call recordAction — count as idle
+      const role = creepRoles.get(creep.id) || 'unknown';
+      diag.idleTicks[creep.id] = (diag.idleTicks[creep.id] || 0) + 1;
+      if (!diag.actionCounts[role]) {
+        diag.actionCounts[role] = { move: 0, attack: 0, heal: 0, harvest: 0, idle: 0 };
+      }
+      diag.actionCounts[role].idle++;
+      // Warn only once every 20 idle ticks so we don’t spam
+      if (diag.idleTicks[creep.id] % 20 === 1) {
+        console.log(`[IDLE T${tick}] creep ${creep.id.slice(-4)} role=${role} idleTicks=${diag.idleTicks[creep.id]}`);
+      }
+    }
+  }
+}
+
+// Draw Visual overlays: role labels + HP bars
+function drawVisuals() {
+  const vis = new Visual(1, false);
+  for (const creep of myCreeps) {
+    if (creep.spawning) continue;
+    const role = (creepRoles.get(creep.id) || '?')[0].toUpperCase();
+    const hpRatio = creep.hits / creep.hitsMax;
+    const color = hpRatio > 0.6 ? '#00ff88' : hpRatio > 0.3 ? '#ffaa00' : '#ff3333';
+    vis.text(role, { x: creep.x, y: creep.y - 0.6 }, { font: '0.4', color: '#ffffff', opacity: 0.85 });
+    // HP bar
+    vis.rect({ x: creep.x - 0.5, y: creep.y + 0.4 }, 1, 0.15, { fill: '#333333', opacity: 0.7, stroke: undefined });
+    vis.rect({ x: creep.x - 0.5, y: creep.y + 0.4 }, hpRatio, 0.15, { fill: color, opacity: 0.9, stroke: undefined });
+  }
+  // Source energy bars
+  for (const src of getObjectsByPrototype(Source)) {
+    const ratio = src.energy / src.energyCapacity;
+    vis.rect({ x: src.x - 0.5, y: src.y + 0.4 }, ratio, 0.15, { fill: '#ffff00', opacity: 0.7, stroke: undefined });
+    vis.text(`${src.energy}`, { x: src.x, y: src.y - 0.6 }, { font: '0.35', color: '#ffff88', opacity: 0.9 });
+  }
+}
+
+// Full end-of-game diagnostic dump
+function dumpEndGameDiag() {
+  if (diag.gameDumped) return;
+  diag.gameDumped = true;
+
+  const myF  = allFlags.filter(f => f.my === true).length;
+  const enF  = allFlags.filter(f => f.my === false).length;
+  const neuF = allFlags.filter(f => f.my === undefined).length;
+
+  const cpuAvg = diag.cpuSamples.length
+    ? Math.round(diag.cpuSamples.reduce((a,b)=>a+b,0) / diag.cpuSamples.length)
+    : 0;
+  const cpuMax = diag.cpuSamples.length ? Math.max(...diag.cpuSamples) : 0;
+
+  // Count total idle ticks
+  const totalIdle = Object.values(diag.idleTicks).reduce((a,b)=>a+b,0);
+
+  console.log('=== CTF END-OF-MATCH DIAGNOSTICS ===');
+  console.log(`Tick: ${tick} | Survivors: ${myCreeps.length} | Flags: my=${myF} enemy=${enF} neutral=${neuF}`);
+  console.log(`Start roster: ${JSON.stringify(diag.startRoster)}`);
+  console.log(`Spawn events (${diag.spawnEvents.length}): ` + diag.spawnEvents.map(e => `T${e.tick}:${e.role}(${e.cost}e)`).join(' | '));
+  console.log(`Death events (${diag.deathEvents.length}): ` + diag.deathEvents.map(e => `T${e.tick}:${e.role}`).join(' | '));
+  console.log(`Flag events (${diag.flagEvents.length}): ` + diag.flagEvents.map(e => `T${e.tick}:${e.type}`).join(' | '));
+  console.log(`Total idle creep-ticks: ${totalIdle}`);
+  console.log(`CPU samples: avg=${cpuAvg}ms max=${cpuMax}ms over ${diag.cpuSamples.length} intervals`);
+  console.log('Action counts by role:');
+  for (const [role, counts] of Object.entries(diag.actionCounts)) {
+    console.log(`  ${role}: ${JSON.stringify(counts)}`);
+  }
+  console.log('=== END DIAGNOSTICS ===');
+}
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  19 · MAIN LOOP — Per-Tick Orchestrator
 // ═══════════════════════════════════════════════════════════════════════════════
 
 export function loop() {
@@ -892,6 +1270,9 @@ export function loop() {
   // ─── TOWER ACTIONS ──────────────────────────────────────
   towerController();
 
+  // ─── SPAWN CONTROLLER ───────────────────────────────────
+  spawnController();
+
   // ─── CREEP ACTIONS ──────────────────────────────────────
   for (const creep of myCreeps) {
     if (creep.spawning) continue;
@@ -903,7 +1284,20 @@ export function loop() {
       case ROLE_MEDIC:     behaviorMedic(creep);     break;
       case ROLE_LOGISTICS: behaviorLogistics(creep); break;
       case ROLE_SENTINEL:  behaviorSentinel(creep);  break;
+      case ROLE_FARMER:    behaviorFarmer(creep);    break;
       default:             behaviorVanguard(creep);  break;
     }
+  }
+
+  // ─── DIAGNOSTICS ────────────────────────────────────────
+  detectAndLogIdle();
+  tickLog();
+  drawVisuals();
+
+  // ─── END-OF-GAME DUMP ───────────────────────────────────
+  const isLastTick = tick >= (arenaInfo.ticksLimit - 1);
+  const allDead    = myCreeps.length === 0 && initialized;
+  if (isLastTick || allDead) {
+    dumpEndGameDiag();
   }
 }
