@@ -98,6 +98,9 @@ const creepTargets        = new Map();  // creepId → target {x,y} set by comma
 // ONE shared focus target computed by commandLayer — all attackers prefer this enemy.
 // Concentrates burst damage to break through enemy heals.
 let globalFocusTarget  = null;
+// true = all roles may advance to objective; false = hold at staging distance.
+// Computed every tick in commandLayer, read by doMoveAction P2c.
+let squadEngageReady   = true;
 let influenceMatrix    = null;
 let lastInfluenceTick  = -Infinity;
 let initialized        = false;
@@ -496,14 +499,16 @@ function shouldPullBack(creep) {
  * See docs/strategy.md §3 for architecture rationale.
  */
 function commandLayer() {
-  // Prefer the flag with FEWEST enemies nearby — counter to deathball-on-one-flag.
-  // When enemy commits 14 to flag A, we go to flag B/C that they cannot also defend.
+  // Net-advantage flag score: (enemies near) - (allies near).
+  // Negative = we outnumber enemy there → good target.
+  // Tiebreaker: closest to current squad centroid (avoids backtracking to own base).
+  const centroid = squadCentroid() || { x: 50, y: 50 };
   function leastDefended(flags) {
-    if (flags.length === 1) return flags[0];
     return flags.reduce((best, f) => {
-      const c = findInRange(f, enemies, 8).length;
-      const b = findInRange(best, enemies, 8).length;
-      return c < b ? f : best;
+      const scoreF = findInRange(f, enemies, 8).length - findInRange(f, myCreeps, 8).length;
+      const scoreB = findInRange(best, enemies, 8).length - findInRange(best, myCreeps, 8).length;
+      if (scoreF !== scoreB) return scoreF < scoreB ? f : best;
+      return getRange(centroid, f) <= getRange(centroid, best) ? f : best;
     });
   }
 
@@ -519,16 +524,28 @@ function commandLayer() {
   }
 
   for (const creep of myCreeps) {
-    if (chargerToTower.has(creep.id)) continue; // charger has its own target
+    if (chargerToTower.has(creep.id)) continue;
     const role = creepRoles.get(creep.id);
     creepTargets.set(creep.id, role === ROLE_SENTINEL ? (myFlag || objective) : objective);
   }
 
-  // ── Global focus target: ONE enemy for all attackers to concentrate on ──────
+  // ── Global focus target ────────────────────────────────────────────
   if (enemies.length > 0) {
     globalFocusTarget = selectFocusTarget({ x: 50, y: 50 }, enemies);
   } else {
     globalFocusTarget = null;
+  }
+
+  // ── Squad engage readiness ─────────────────────────────────────────
+  // Compares how many enemies vs allies are within range 8 of the objective.
+  // If heavily outnumbered (>2:1), all roles hold at staging distance.
+  // Any creep already in combat (enemy within range 4) ignores this — no freezing mid-fight.
+  if (objective) {
+    const enemiesAtObj = findInRange(objective, enemies, 8).length;
+    const alliesAtObj  = findInRange(objective, myCreeps, 8).length;
+    squadEngageReady = (enemiesAtObj <= alliesAtObj * 2 + 1);
+  } else {
+    squadEngageReady = true;
   }
 }
 
@@ -868,6 +885,15 @@ function doMoveAction(creep) {
     }
   }
 
+  // P2c: Staging gate — ALL roles respect this.
+  // When the objective is heavily defended and we are NOT yet in combat,
+  // hold position so the squad accumulates before engaging.
+  // In-combat creeps (enemy within range 4) are exempt — they must keep moving.
+  if (!squadEngageReady) {
+    const alreadyFighting = findInRange(creep, enemies, 4).length > 0;
+    if (!alreadyFighting) return; // hold: doCombatAction still fires (rangers shoot from here)
+  }
+
   // P3: Role-specific local movement
   if (role === ROLE_MEDIC) {
     const frontline = myCreeps.filter(c => {
@@ -975,24 +1001,8 @@ function doMoveAction(creep) {
     const t = selectFocusTarget(creep, nearEnemies);
     if (t) { creep.moveTo(t, pathOpts()); return; }
   }
-
-  // P5: Advance to commander target with quorum gate.
-  // If the objective is heavily defended and we're approaching alone, hold at
-  // staging distance (~8 tiles) until enough allies accumulate — then push together.
-  // This prevents the 1v14 pattern where creeps trickle into an enemy deathball.
   const obj = creepTargets.get(creep.id);
-  if (obj) {
-    const distToObj      = getRange(creep, obj);
-    const enemiesAtObj   = findInRange(obj, enemies, 8).length;
-    const alliesAtObj    = myCreeps.filter(c => c.id !== creep.id && getRange(c, obj) <= 8).length;
-    // Hold if outnumbered 2x+ AND not already in combat (>range 5 from all enemies)
-    const inCombat       = findInRange(creep, enemies, 5).length > 0;
-    if (!inCombat && distToObj <= 10 && enemiesAtObj > alliesAtObj * 2 + 1) {
-      // Staging: hold at the edge of the engagement zone — rangers still shoot, medics heal
-      return;
-    }
-    creep.moveTo(obj, pathOpts());
-  }
+  if (obj) creep.moveTo(obj, pathOpts());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
