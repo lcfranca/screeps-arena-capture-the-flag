@@ -82,6 +82,9 @@ const TOWER_CHARGE_THRESHOLD = 0.8; // 80% full → stop charging
 // Radius around a tower: if a free creep with CARRY enters this range and no
 // charger is assigned yet, ONE is assigned exclusively to that tower.
 const TOWER_ASSIGN_RADIUS    = 12;
+// Max tiles a non-retreating creep deviates to step on an uncaptured flag.
+// Kept tiny (2) so combat and advance are not disrupted.
+const FLAG_CAPTURE_RADIUS    = 2;
 
 // ─── PERSISTENT STATE (survives across ticks) ────────────────────────────────
 const creepRoles          = new Map();  // id → role string
@@ -769,6 +772,18 @@ function doMoveAction(creep) {
       adj.sort((a, b) => (prio[b.type] || 0) - (prio[a.type] || 0));
       creep.moveTo(adj[0]);
       return;
+    }
+  }
+
+  // P2b: Uncaptured flag within tiny radius — step on it without breaking combat.
+  // Only diverts if no enemy is melee-adjacent (don't walk into open attacks).
+  // Mirrors the body-part micro-divert pattern exactly.
+  const uncaptured = [...neutralFlags, ...enemyFlags];
+  if (uncaptured.length > 0 && findInRange(creep, enemies, 1).length === 0) {
+    const nearFlag = findInRange(creep, uncaptured, FLAG_CAPTURE_RADIUS);
+    if (nearFlag.length > 0) {
+      const closest = findClosestByRange(creep, nearFlag);
+      if (closest) { creep.moveTo(closest); return; }
     }
   }
 
