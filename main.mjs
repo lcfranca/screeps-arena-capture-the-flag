@@ -511,6 +511,38 @@ function commandLayer() {
       const nc = combatCreeps.length > 0 ? findClosestByRange(m, combatCreeps) : null;
       if (nc) creepTargets.set(m.id, creepTargets.get(nc.id));
     }
+
+    // ── THREAT-AWARE REGROUPING ─────────────────────────────────────────
+    // Each tick, check if any flag group faces an enemy deathball.
+    // If enemies near a group outnumber that group, regroup ALL to the
+    // safest flag (fewest nearby enemies).  This is the "Bayesian update"
+    // that prevents a split force from being destroyed piecemeal.
+    if (neutralFlags.length >= 2) {
+      for (const flag of neutralFlags) {
+        // Count creeps assigned to this flag
+        const groupCreeps = [...combatCreeps, ...medics].filter(c =>
+          creepTargets.get(c.id) === flag
+        );
+        if (groupCreeps.length === 0) continue;
+
+        // Check enemy force near this group's path (use group centroid)
+        const gx = Math.round(groupCreeps.reduce((s, c) => s + c.x, 0) / groupCreeps.length);
+        const gy = Math.round(groupCreeps.reduce((s, c) => s + c.y, 0) / groupCreeps.length);
+        const nearEn = findInRange({ x: gx, y: gy }, enemies, 12).length;
+
+        if (nearEn > groupCreeps.length + 2) {
+          // This group is outmatched — regroup EVERYONE to the safer flag
+          const safest = neutralFlags.reduce((best, f) => {
+            const enA = findInRange(f, enemies, 12).length;
+            const enB = findInRange(best, enemies, 12).length;
+            return enA < enB ? f : best;
+          });
+          for (const c of combatCreeps) creepTargets.set(c.id, safest);
+          for (const m of medics) creepTargets.set(m.id, safest);
+          break;
+        }
+      }
+    }
     return;
   }
 
@@ -844,6 +876,23 @@ function doMoveAction(creep) {
 
   // ── P1: Body part on same tile — stay to auto-collect ─────────────────
   if (bodyParts.some(b => b.x === creep.x && b.y === creep.y)) return;
+
+  // ── P1.5: OUTNUMBERED RETREAT — regroup with main force ──────────────
+  // If locally outnumbered (enemies in r7 > allies in r7 + 2), don't
+  // engage — fall back toward the largest cluster of far allies.
+  // This prevents isolated sub-groups from being destroyed piecemeal.
+  if (role !== ROLE_MEDIC) {
+    const localAllies  = findInRange(creep, myCreeps, 7).length;  // includes self
+    const localEnemies = findInRange(creep, enemies, 7).length;
+    if (localEnemies > localAllies + 2 && localEnemies >= 3) {
+      const farAllies = myCreeps.filter(c => c.id !== creep.id && getRange(creep, c) > 7);
+      if (farAllies.length >= 2) {
+        const cx = Math.round(farAllies.reduce((s, c) => s + c.x, 0) / farAllies.length);
+        const cy = Math.round(farAllies.reduce((s, c) => s + c.y, 0) / farAllies.length);
+        creep.moveTo({ x: cx, y: cy }, pathOpts()); return;
+      }
+    }
+  }
 
   // ── P2: FLAG CAPTURE — go capture nearby uncaptured flag ──────────────
   // Highest action priority after survival. Only when not in immediate combat.
