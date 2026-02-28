@@ -70,6 +70,8 @@ const ROLE_REEVAL_TICKS        = 30;
 const BODYPART_DEVIATE_RANGE   = 3;
 const KITE_FLEE_RANGE          = 3;
 const EMERGENCY_FLEE_RANGE     = 10;
+const MOSQUITO_DETECT_RANGE    = 12;   // scan radius for local force balance
+const MOSQUITO_FLEE_RANGE      = 5;    // start fleeing when enemies in r5
 const SENTINEL_PATROL_RANGE    = 4;
 const TOWER_THREAT_WEIGHT      = 0.20;
 const ENEMY_THREAT_RADIUS      = 6;
@@ -550,7 +552,7 @@ function commandLayer() {
         const gy = Math.round(groupCreeps.reduce((s, c) => s + c.y, 0) / groupCreeps.length);
         const nearEn = findInRange({ x: gx, y: gy }, enemies, 12).length;
 
-        if (nearEn > groupCreeps.length * 1.5 && nearEn >= 3) {
+        if (nearEn >= groupCreeps.length && nearEn >= 3) {
           // This group is outmatched — regroup EVERYONE to the safer flag
           const safest = neutralFlags.reduce((best, f) => {
             const enA = findInRange(f, enemies, 12).length;
@@ -598,6 +600,23 @@ function commandLayer() {
     if (chargerToTower.has(creep.id)) continue;
     creepTargets.set(creep.id, objective);
   }
+
+  // ── STRAGGLER CONSOLIDATION ──────────────────────────────────────────────
+  // After Phase 1 parallel rush, the force is often physically split. Creeps
+  // far from the team centroid that face nearby enemies should merge with the
+  // main group BEFORE walking solo into the enemy deathball.
+  if (centroid) {
+    for (const creep of myCreeps) {
+      if (chargerToTower.has(creep.id)) continue;
+      const distToCentroid = getRange(creep, centroid);
+      if (distToCentroid > 15) {
+        const nearbyEn = findInRange(creep, enemies, MOSQUITO_DETECT_RANGE);
+        if (nearbyEn.length >= 3) {
+          creepTargets.set(creep.id, centroid);
+        }
+      }
+    }
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -630,6 +649,27 @@ function squadCentroid() {
   const ax = Math.round(squad.reduce((s, c) => s + c.x, 0) / squad.length);
   const ay = Math.round(squad.reduce((s, c) => s + c.y, 0) / squad.length);
   return { x: ax, y: ay };
+}
+
+/**
+ * Mosquito detection: is this creep in a locally-outnumbered situation
+ * where it should kite toward allied mass instead of fighting?
+ * Triggers when: outnumbered locally, or at parity with split force.
+ * Does NOT trigger when the full force faces the enemy (no one to merge with).
+ */
+function isMosquitoSituation(creep) {
+  const localAllies  = findInRange(creep, myCreeps, MOSQUITO_DETECT_RANGE).length;
+  const localEnemies = findInRange(creep, enemies, MOSQUITO_DETECT_RANGE).length;
+  if (localEnemies < 3) return false;  // too few enemies to worry about
+
+  // Clearly outnumbered locally → mosquito
+  if (localEnemies > localAllies) return true;
+
+  // At parity but force is split (far allies exist to merge with) → mosquito
+  const farAllies = myCreeps.filter(c =>
+    c.id !== creep.id && getRange(creep, c) > MOSQUITO_DETECT_RANGE
+  );
+  return localEnemies >= localAllies && farAllies.length >= 2;
 }
 
 /**
@@ -910,54 +950,49 @@ function doMoveAction(creep) {
   // ── P1: Body part on same tile — stay to auto-collect ─────────────────
   if (bodyParts.some(b => b.x === creep.x && b.y === creep.y)) return;
 
-  // ── P1.5: OUTNUMBERED KITE-BACK — fighting retreat toward allies ─────
-  // If locally outnumbered, kite-back toward nearest allied cluster.
-  // ALL roles participate (including medics—they must retreat WITH the group
-  // or they die alone after combat creeps flee).
-  // During kite-back, doCombatAction still fires ranged attacks/heals,
-  // so DPS and healing are sustained while retreating.
-  {
-    const localAllies  = findInRange(creep, myCreeps, 8).length;  // includes self
-    const localEnemies = findInRange(creep, enemies, 8).length;
-    // Trigger: outnumbered by 50% AND at least 3 enemies in zone.
-    // E.g. 5 allies vs 8 enemies (8 > 5*1.5=7.5) → kite back.
-    const outnumbered = localEnemies > localAllies * 1.5 && localEnemies >= 3;
+  // ── P1.5: MOSQUITO KITE-BACK — sustain & kite toward allied mass ─────
+  // Locally outnumbered? REFUSE to engage. Kite toward the far allied cluster
+  // to merge forces. If universally outnumbered, fall back to tower/flag cover.
+  // ALL roles participate uniformly. DPS & healing sustained by doCombatAction.
+  // Priority: ZERO deaths in disadvantaged situations.
+  if (isMosquitoSituation(creep)) {
+    const farAllies = myCreeps.filter(c =>
+      c.id !== creep.id && getRange(creep, c) > MOSQUITO_DETECT_RANGE
+    );
 
-    if (outnumbered) {
-      // Find the nearest allied cluster center to kite TOWARD.
-      // Cluster = allies that are NOT in our local danger zone (>8 tiles away).
-      const farAllies = myCreeps.filter(c => c.id !== creep.id && getRange(creep, c) > 8);
-
-      if (farAllies.length >= 1) {
-        // Kite toward allied cluster centroid
-        const cx = Math.round(farAllies.reduce((s, c) => s + c.x, 0) / farAllies.length);
-        const cy = Math.round(farAllies.reduce((s, c) => s + c.y, 0) / farAllies.length);
-        const safePoint = { x: cx, y: cy };
-
-        if (role === ROLE_MEDIC) {
-          // Medics: move toward safe point while staying near their group
-          creep.moveTo(safePoint, pathOpts()); return;
-        }
-
-        // Combat creeps: if enemies in r2, flee toward safe point (kite)
-        const closeEnemies = findInRange(creep, enemies, 2);
-        if (closeEnemies.length > 0) {
-          // Compute flee direction biased toward safe point
-          const result = searchPath(
-            creep,
-            closeEnemies.map(e => ({ pos: e, range: 4 })),
-            pathOpts(true),
-          );
-          if (result.path.length > 0) {
-            creep.move(getDirection(result.path[0].x - creep.x, result.path[0].y - creep.y));
-            return;
-          }
-        }
-        // No immediate melee threat: walk toward safe point
-        creep.moveTo(safePoint, pathOpts()); return;
-      }
-      // No far allies → hold ground (don't flee to nothing, better to fight)
+    // Determine kite target: far allies centroid or fallback to tower/flag
+    let safePoint = null;
+    if (farAllies.length >= 1) {
+      const cx = Math.round(farAllies.reduce((s, c) => s + c.x, 0) / farAllies.length);
+      const cy = Math.round(farAllies.reduce((s, c) => s + c.y, 0) / farAllies.length);
+      safePoint = { x: cx, y: cy };
+    } else {
+      // Universally outnumbered — fall back under tower / flag cover
+      const activeTower = myTowers.find(t =>
+        t.store && t.store.getUsedCapacity(RESOURCE_ENERGY) > 0
+      );
+      safePoint = activeTower || myFlag;
     }
+
+    if (safePoint) {
+      // Enemies within MOSQUITO_FLEE_RANGE → flee for immediate safety
+      const nearEn = findInRange(creep, enemies, MOSQUITO_FLEE_RANGE);
+      if (nearEn.length > 0) {
+        const result = searchPath(
+          creep,
+          nearEn.map(e => ({ pos: e, range: MOSQUITO_FLEE_RANGE + 3 })),
+          pathOpts(true),
+        );
+        if (result.path.length > 0) {
+          creep.move(getDirection(result.path[0].x - creep.x, result.path[0].y - creep.y));
+          return;
+        }
+      }
+      // No immediate threat or flee failed → path toward safe point
+      creep.moveTo(safePoint, pathOpts());
+      return;
+    }
+    // No safe point → fall through to normal combat behavior
   }
 
   // ── P2: FLAG CAPTURE — go capture nearby uncaptured flag ──────────────
@@ -1180,11 +1215,13 @@ function tickLog() {
   const enF  = allFlags.filter(f => f.my === false).length;
   const neuF = allFlags.filter(f => f.my === undefined).length;
   const chargerCount = chargerToTower.size;
+  const mosquitoCount = myCreeps.filter(c => isMosquitoSituation(c)).length;
 
   console.log(
     `[T${tick}] CPU=${cpu}ms alive=${myCreeps.length} enemies=${enemies.length}` +
     ` flags(my=${myF} en=${enF} neu=${neuF})` +
     ` towers=[${towerStatus}] chargers=${chargerCount}` +
+    ` mosquito=${mosquitoCount}` +
     ` roles=${JSON.stringify(roles)}`
   );
 }
