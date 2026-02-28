@@ -59,6 +59,7 @@ const ROLE_VANGUARD  = 'vanguard';
 const ROLE_RANGER    = 'ranger';
 const ROLE_MEDIC     = 'medic';
 const ROLE_SENTINEL  = 'sentinel';
+const ROLE_RUNNER    = 'runner';
 
 // ─── CONFIGURATION ──────────────────────────────────────────────────────────
 const RETREAT_HP_RATIO         = 0.30;
@@ -100,6 +101,7 @@ const creepTargets        = new Map();  // creepId → target {x,y} set by comma
 // ONE shared focus target computed by commandLayer — all attackers prefer this enemy.
 // Concentrates burst damage to break through enemy heals.
 let globalFocusTarget  = null;
+let currentTank        = null;   // creep ID of the designated tank (absorbs enemy focus)
 let influenceMatrix    = null;
 let lastInfluenceTick  = -Infinity;
 let initialized        = false;
@@ -161,6 +163,8 @@ function refreshWorldState() {
       const role = creepRoles.get(id) || 'unknown';
       diag.deathEvents.push({ tick, id, role });
       creepRoles.delete(id);
+      // Release tank designation if this was the tank
+      if (currentTank === id) currentTank = null;
       // Release tower charge assignment if this creep was a charger
       const tid = chargerToTower.get(id);
       if (tid) towerChargeAssigned.delete(tid);
@@ -241,13 +245,24 @@ function classifyCreep(creep) {
 
 function assignRoles() {
   const counts = {
-    [ROLE_VANGUARD]: 0, [ROLE_RANGER]: 0, [ROLE_MEDIC]: 0, [ROLE_SENTINEL]: 0,
+    [ROLE_VANGUARD]: 0, [ROLE_RANGER]: 0, [ROLE_MEDIC]: 0, [ROLE_SENTINEL]: 0, [ROLE_RUNNER]: 0,
   };
 
   for (const creep of myCreeps) {
     const role = classifyCreep(creep);
     creepRoles.set(creep.id, role);
     counts[role]++;
+  }
+
+  // Designate 2 vanguards as dedicated flag RUNNERS (fastest first)
+  const vanguardList = myCreeps
+    .filter(c => creepRoles.get(c.id) === ROLE_VANGUARD)
+    .sort((a, b) => countParts(b, MOVE) - countParts(a, MOVE));
+  const numRunners = Math.min(2, vanguardList.length);
+  for (let i = 0; i < numRunners; i++) {
+    creepRoles.set(vanguardList[i].id, ROLE_RUNNER);
+    counts[ROLE_VANGUARD]--;
+    counts[ROLE_RUNNER]++;
   }
 
   // Snapshot initial roster for diagnostics
@@ -296,6 +311,11 @@ function reevaluateRoles() {
     }
   }
 
+  // Emergency: no vanguards but >1 runner → promote one runner back
+  if (!counts[ROLE_VANGUARD] && (counts[ROLE_RUNNER] || 0) > 1) {
+    const runnerList = myCreeps.filter(c => creepRoles.get(c.id) === ROLE_RUNNER);
+    if (runnerList.length > 0) creepRoles.set(runnerList[0].id, ROLE_VANGUARD);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -506,138 +526,65 @@ function commandLayer() {
   // ── Global focus target ──────────────────────────────────────────────────
   globalFocusTarget = enemies.length > 0 ? selectFocusTarget(centroid, enemies) : null;
 
+  // ── Designate tank — picks healthiest vanguard for heal-ball formation ──
+  designateTank();
+
   const uncaptured = [...neutralFlags, ...enemyFlags];
+  const runners = myCreeps.filter(c =>
+    creepRoles.get(c.id) === ROLE_RUNNER && !chargerToTower.has(c.id)
+  );
+  const mainArmy = myCreeps.filter(c => {
+    const r = creepRoles.get(c.id);
+    return r !== ROLE_RUNNER && !chargerToTower.has(c.id);
+  });
 
-  // ── Phase 1: Parallel Flag Rush ──────────────────────────────────────────
-  // Split force to capture neutral flags simultaneously before enemy.
-  // Enemy captures both neutrals by ~T77; we must race with split parties.
+  // ── Phase 1: Flag Rush ───────────────────────────────────────────────────
+  // Runners rush flags independently. Main army stays TOGETHER and marches
+  // to the nearest neutral flag as a deathball — never split the main army.
   if (tick <= PHASE_EXPAND_END && neutralFlags.length > 0) {
-    const combatCreeps = myCreeps
-      .filter(c => !chargerToTower.has(c.id) && creepRoles.get(c.id) !== ROLE_MEDIC)
-      .sort((a, b) => countParts(b, MOVE) - countParts(a, MOVE));
-
-    if (neutralFlags.length >= 2) {
-      // Distribute combat creeps across neutral flags evenly
-      for (let i = 0; i < combatCreeps.length; i++) {
-        creepTargets.set(combatCreeps[i].id, neutralFlags[i % neutralFlags.length]);
-      }
-    } else {
-      for (const c of combatCreeps) creepTargets.set(c.id, neutralFlags[0]);
-    }
-
-    // Medics follow their nearest combat ally's target
-    const medics = myCreeps.filter(c =>
-      creepRoles.get(c.id) === ROLE_MEDIC && !chargerToTower.has(c.id)
+    assignRunnerTargets(runners);
+    const nearestNeutral = neutralFlags.reduce((best, f) =>
+      getRange(centroid, f) < getRange(centroid, best) ? f : best
     );
-    for (const m of medics) {
-      const nc = combatCreeps.length > 0 ? findClosestByRange(m, combatCreeps) : null;
-      if (nc) creepTargets.set(m.id, creepTargets.get(nc.id));
-    }
-
-    // ── THREAT-AWARE REGROUPING ─────────────────────────────────────────
-    // Each tick, check if any flag group faces an enemy deathball.
-    // If enemies near a group outnumber that group, regroup ALL to the
-    // safest flag (fewest nearby enemies).  This is the "Bayesian update"
-    // that prevents a split force from being destroyed piecemeal.
-    if (neutralFlags.length >= 2) {
-      for (const flag of neutralFlags) {
-        // Count creeps assigned to this flag
-        const groupCreeps = [...combatCreeps, ...medics].filter(c =>
-          creepTargets.get(c.id) === flag
-        );
-        if (groupCreeps.length === 0) continue;
-
-        // Check enemy force near this group's path (use group centroid)
-        const gx = Math.round(groupCreeps.reduce((s, c) => s + c.x, 0) / groupCreeps.length);
-        const gy = Math.round(groupCreeps.reduce((s, c) => s + c.y, 0) / groupCreeps.length);
-        const nearEn = findInRange({ x: gx, y: gy }, enemies, 12).length;
-
-        if (nearEn >= groupCreeps.length && nearEn >= 3) {
-          // This group is outmatched — regroup EVERYONE to the safer flag
-          const safest = neutralFlags.reduce((best, f) => {
-            const enA = findInRange(f, enemies, 12).length;
-            const enB = findInRange(best, enemies, 12).length;
-            return enA < enB ? f : best;
-          });
-          for (const c of combatCreeps) creepTargets.set(c.id, safest);
-          for (const m of medics) creepTargets.set(m.id, safest);
-          break;
-        }
-      }
+    for (const creep of mainArmy) {
+      creepTargets.set(creep.id, nearestNeutral);
     }
     return;
   }
 
-  // ── Phase 2+: Single Objective with STICKINESS ───────────────────────────
-  // Prevents oscillation: once committed, hold for STICKY_TICKS.
-  // Re-evaluate early only if: sticky flag captured, lost, or gone.
-  let objective = null;
+  // ── RUNNER TARGETS — always chase uncaptured flags ───────────────────────
+  assignRunnerTargets(runners);
 
-  // When dominant, reduce stickiness to react faster to flag flips
-  const effectiveSticky = (myCreeps.length >= enemies.length * 2) ? 10 : STICKY_TICKS;
-
-  // Check if sticky objective is still valid
-  const stickyStillValid = stickyObjective &&
-    uncaptured.some(f => f.id === stickyObjective.id) &&
-    (tick - stickySetTick) < effectiveSticky;
-
-  if (stickyStillValid) {
-    objective = uncaptured.find(f => f.id === stickyObjective.id);
-  } else if (uncaptured.length > 0) {
-    // Pick uncaptured flag with FEWEST enemy defenders.
-    // Tiebreak: closest to squad centroid.
-    objective = uncaptured.reduce((best, f) => {
-      const ef = findInRange(f, enemies, 8).length;
-      const eb = findInRange(best, enemies, 8).length;
-      if (ef !== eb) return ef < eb ? f : best;
-      return getRange(centroid, f) <= getRange(centroid, best) ? f : best;
-    });
-    stickyObjective = objective;
-    stickySetTick = tick;
-  } else {
-    objective = myFlag;
-    stickyObjective = null;
-  }
-
-  // ── DOMINANT MULTI-SWEEP — capture multiple flags in parallel ────────────
-  // When we massively outnumber the enemy, one deathball is wasteful.
-  // Split into groups to sweep all uncaptured flags simultaneously.
-  const dominant = myCreeps.length >= enemies.length * 2 && enemies.length > 0;
-  const availableCreeps = myCreeps.filter(c => !chargerToTower.has(c.id));
-
-  if (dominant && uncaptured.length > 1) {
-    // Sort uncaptured by distance to centroid for efficient sweep
-    const sorted = uncaptured.slice().sort((a, b) =>
-      getRange(centroid, a) - getRange(centroid, b)
-    );
-    // Assign creeps round-robin across flags, weighted toward nearest
-    for (let i = 0; i < availableCreeps.length; i++) {
-      const flag = sorted[i % sorted.length];
-      creepTargets.set(availableCreeps[i].id, flag);
+  // ── MAIN ARMY — hunt the largest enemy concentration ────────────────────
+  const enemyCenter = findEnemyCentroid();
+  if (enemyCenter && enemies.length > 0) {
+    // All main army converges on enemy blob to destroy it
+    for (const creep of mainArmy) {
+      creepTargets.set(creep.id, enemyCenter);
     }
   } else {
-    for (const creep of availableCreeps) {
-      creepTargets.set(creep.id, objective);
+    // No enemies — capture remaining flags
+    const obj = uncaptured.length > 0
+      ? uncaptured.reduce((best, f) =>
+          getRange(centroid, f) < getRange(centroid, best) ? f : best)
+      : myFlag;
+    for (const creep of mainArmy) {
+      creepTargets.set(creep.id, obj || myFlag);
     }
   }
 
   // ── FLAG DEFENSE INTERCEPTOR — anti-rush & anti-sneak ──────────────────
-  // Scan for enemies near OUR captured flags. If a flag is undefended and
-  // threatened, redirect the CLOSEST combat creep to intercept.
-  // This stops lone scouts from flipping flags behind our lines.
   const myOwnedFlags = allFlags.filter(f => f.my === true);
   for (const flag of myOwnedFlags) {
     const threatsNearFlag = findInRange(flag, enemies, 10);
     if (threatsNearFlag.length === 0) continue;
-    // Already defended? Check if any ally is within 5 tiles
     const defendersNear = findInRange(flag, myCreeps, 5).filter(c =>
       !chargerToTower.has(c.id)
     );
     if (defendersNear.length > 0) continue;
-    // Redirect closest combat creep to intercept
-    const interceptors = myCreeps.filter(c => {
+    const interceptors = mainArmy.filter(c => {
       const r = creepRoles.get(c.id);
-      return (r === ROLE_VANGUARD || r === ROLE_RANGER) && !chargerToTower.has(c.id);
+      return r === ROLE_VANGUARD || r === ROLE_RANGER;
     });
     if (interceptors.length === 0) continue;
     const closest = findClosestByRange(flag, interceptors);
@@ -645,13 +592,8 @@ function commandLayer() {
   }
 
   // ── STRAGGLER CONSOLIDATION ──────────────────────────────────────────────
-  // After Phase 1 parallel rush, the force is often physically split. Creeps
-  // far from the team centroid that face nearby enemies should merge with the
-  // main group BEFORE walking solo into the enemy deathball.
-  // Skip when dominant — stragglers are sweeping flags intentionally.
-  if (centroid && !dominant) {
-    for (const creep of myCreeps) {
-      if (chargerToTower.has(creep.id)) continue;
+  if (centroid) {
+    for (const creep of mainArmy) {
       const distToCentroid = getRange(creep, centroid);
       if (distToCentroid > 15) {
         const nearbyEn = findInRange(creep, enemies, MOSQUITO_DETECT_RANGE);
@@ -732,6 +674,119 @@ function groupStrength(creeps) {
     str += countActive(c, HEAL) * HEAL_POWER;
   }
   return str;
+}
+
+/**
+ * Designate the best tank: healthiest vanguard with most ATTACK+TOUGH parts.
+ * The tank leads the heal-ball — all medics form behind it.
+ * Called once per tick from commandLayer.
+ */
+function designateTank() {
+  const vanguards = myCreeps.filter(c =>
+    creepRoles.get(c.id) === ROLE_VANGUARD && !chargerToTower.has(c.id)
+  );
+  if (vanguards.length === 0) {
+    currentTank = null;
+    return;
+  }
+  // Prefer current tank if still alive and healthy (>40% HP)
+  if (currentTank) {
+    const ct = vanguards.find(c => c.id === currentTank);
+    if (ct && ct.hits > ct.hitsMax * 0.40) return; // keep current
+  }
+  // Sort by HP ratio desc, then total body parts desc
+  vanguards.sort((a, b) => {
+    const ra = a.hits / a.hitsMax;
+    const rb = b.hits / b.hitsMax;
+    if (ra !== rb) return rb - ra;
+    return b.body.length - a.body.length;
+  });
+  currentTank = vanguards[0].id;
+}
+
+/**
+ * Compute the formation point for a medic: 3 tiles BEHIND the tank,
+ * on the opposite side from the enemy threat centroid.
+ * This is the core of the heal-ball micro.
+ */
+function getFormationPoint(tank) {
+  // Enemy centroid (threat direction)
+  const nearEnemies = findInRange(tank, enemies, 10);
+  if (nearEnemies.length === 0) return null; // no enemies = no need for formation
+  
+  const ex = nearEnemies.reduce((s, e) => s + e.x, 0) / nearEnemies.length;
+  const ey = nearEnemies.reduce((s, e) => s + e.y, 0) / nearEnemies.length;
+  
+  // Direction from enemies to tank (unit vector)
+  const dx = tank.x - ex;
+  const dy = tank.y - ey;
+  const mag = Math.sqrt(dx * dx + dy * dy) || 1;
+  
+  // Formation point = 3 tiles behind tank (away from enemies)
+  const fx = Math.round(tank.x + (dx / mag) * 3);
+  const fy = Math.round(tank.y + (dy / mag) * 3);
+  
+  // Clamp to arena bounds
+  return {
+    x: Math.max(1, Math.min(98, fx)),
+    y: Math.max(1, Math.min(98, fy)),
+  };
+}
+
+/**
+ * Find the centroid of the largest enemy cluster.
+ * Used by main army to converge on the biggest enemy group.
+ */
+function findEnemyCentroid() {
+  if (enemies.length === 0) return null;
+  // Find the enemy with the most allies within r10 (cluster center)
+  let bestCenter = enemies[0];
+  let bestCount = 0;
+  for (const enemy of enemies) {
+    const count = findInRange(enemy, enemies, 10).length;
+    if (count > bestCount) {
+      bestCount = count;
+      bestCenter = enemy;
+    }
+  }
+  // Compute centroid of that cluster
+  const cluster = findInRange(bestCenter, enemies, 10);
+  const cx = Math.round(cluster.reduce((s, e) => s + e.x, 0) / cluster.length);
+  const cy = Math.round(cluster.reduce((s, e) => s + e.y, 0) / cluster.length);
+  return { x: cx, y: cy };
+}
+
+/**
+ * Assign runner targets: distribute runners across uncaptured flags.
+ * Prefers undefended flags (no enemies within 8 tiles).
+ * If all flags captured, runners patrol owned flags to re-defend.
+ */
+function assignRunnerTargets(runners) {
+  if (runners.length === 0) return;
+  const uncaptured = [...neutralFlags, ...enemyFlags];
+
+  if (uncaptured.length === 0) {
+    // All flags captured — patrol our flags to quickly recapture if lost
+    const myOwnedFlags = allFlags.filter(f => f.my === true);
+    for (let i = 0; i < runners.length; i++) {
+      const flag = myOwnedFlags[i % Math.max(1, myOwnedFlags.length)] || myFlag;
+      if (flag) creepTargets.set(runners[i].id, flag);
+    }
+    return;
+  }
+
+  // Prefer undefended flags (no enemies within 8)
+  const undefended = uncaptured.filter(f => findInRange(f, enemies, 8).length === 0);
+  const pool = undefended.length > 0 ? undefended : uncaptured;
+
+  // Distribute runners to different flags when possible
+  const assigned = new Set();
+  for (const runner of runners) {
+    const sorted = pool.slice().sort((a, b) => getRange(runner, a) - getRange(runner, b));
+    const target = sorted.find(f => !assigned.has(f.id)) || sorted[0];
+    creepTargets.set(runner.id, target);
+    if (target) assigned.add(target.id);
+  }
 }
 
 /**
@@ -901,13 +956,40 @@ function doCombatAction(creep) {
     return null;
   }
 
+  // RUNNER: defensive combat only — self-heal > ranged > melee
+  if (role === ROLE_RUNNER) {
+    if (hasActive(creep, HEAL) && creep.hits < creep.hitsMax) {
+      creep.heal(creep); return 'heal';
+    }
+    if (hasActive(creep, RANGED_ATTACK)) {
+      const inR3 = findInRange(creep, enemies, 3);
+      if (inR3.length >= 3) { creep.rangedMassAttack(); return 'attack'; }
+      if (inR3.length > 0) { creep.rangedAttack(inR3[0]); return 'attack'; }
+    }
+    if (hasActive(creep, ATTACK)) {
+      const adj = findInRange(creep, enemies, 1);
+      if (adj.length > 0) { creep.attack(adj[0]); return 'attack'; }
+    }
+    return null;
+  }
+
   if (role === ROLE_MEDIC) {
-    // Medics: healing always beats attacking
+    // Medics: healing always beats attacking.
+    // Tank gets priority heals to sustain the heal-ball formation.
     if (hasActive(creep, HEAL)) {
       const damaged = myCreeps.filter(c => c.hits < c.hitsMax && c.id !== creep.id);
       const adjDmg  = findInRange(creep, damaged, 1);
       const nearDmg = findInRange(creep, damaged, 3);
-      // Heal by HP ratio (most critical first), not absolute HP
+
+      // Prefer tank if it's damaged and in range (concentrate heals on focal point)
+      const tank = currentTank ? damaged.find(c => c.id === currentTank) : null;
+      if (tank) {
+        const tankDist = getRange(creep, tank);
+        if (tankDist <= 1) { creep.heal(tank); return 'heal'; }
+        if (tankDist <= 3) { creep.rangedHeal(tank); return 'heal'; }
+      }
+
+      // Heal by HP ratio (most critical first)
       if (adjDmg.length > 0) {
         const t = adjDmg.reduce((b, c) => (c.hits/c.hitsMax) < (b.hits/b.hitsMax) ? c : b);
         creep.heal(t); return 'heal';
@@ -998,7 +1080,22 @@ function doMoveAction(creep) {
     return;
   }
 
-  // ── P0.5: Soft pull-back toward nearest medic ────────────────────────────
+  // ── RUNNER: dedicated flag capture — skip all combat/formation logic ─────
+  if (role === ROLE_RUNNER) {
+    if (bodyParts.some(b => b.x === creep.x && b.y === creep.y)) return;
+    if (objective) {
+      const nearEn = findInRange(creep, enemies, 6);
+      creep.moveTo(objective, nearEn.length > 0 ? pathOpts() : aggressivePathOpts());
+      return;
+    }
+    if (bodyParts.length > 0) {
+      const bp = findClosestByRange(creep, bodyParts);
+      if (bp && getRange(creep, bp) <= 8) { creep.moveTo(bp); return; }
+    }
+    return;
+  }
+
+  // ── P0.5: Soft pull-back — step toward nearest medic for heal ────────────
   if (shouldPullBack(creep)) {
     const medics = myCreeps.filter(c => creepRoles.get(c.id) === ROLE_MEDIC);
     if (medics.length > 0) {
@@ -1007,6 +1104,7 @@ function doMoveAction(creep) {
         creep.moveTo(nearest, pathOpts()); return;
       }
     }
+    // No medics or already adjacent — keep fighting
   }
 
   // ── P1: Body part on same tile — stay to auto-collect ─────────────────
@@ -1047,18 +1145,15 @@ function doMoveAction(creep) {
   }
 
   // ── P1.7: OPPORTUNITY AGGRESSION — pursue weak enemy groups ───────────
-  // If we have decisive local superiority, chase and destroy.
-  // This catches enemy scouts/runners passing near our force.
-  if (role === ROLE_VANGUARD || role === ROLE_RANGER) {
+  // Only RANGERS chase scouts. Vanguards NEVER chase — they hold the screen.
+  if (role === ROLE_RANGER) {
     const localAllies  = findInRange(creep, myCreeps, 8);
     const localEnemies = findInRange(creep, enemies, 10);
     if (localEnemies.length > 0 && localEnemies.length <= 3 &&
         groupStrength(localAllies) > groupStrength(localEnemies) * 2) {
-      // Decisive advantage — hunt them down
       const target = selectFocusTarget(creep, localEnemies);
       if (target) {
-        const opts = role === ROLE_VANGUARD ? aggressivePathOpts() : pathOpts();
-        creep.moveTo(target, opts);
+        creep.moveTo(target, pathOpts());
         return;
       }
     }
@@ -1069,7 +1164,7 @@ function doMoveAction(creep) {
   // (their engagement range) to avoid flag-detours during combat.
   // Rangers/Medics suppress at r3 (they can kite/heal near flags).
   {
-    const suppressR = role === ROLE_VANGUARD ? 6 : 3;
+    const suppressR = role === ROLE_VANGUARD ? 8 : 3;
     if (findInRange(creep, enemies, suppressR).length === 0) {
       const capRadius = role === ROLE_MEDIC ? 3 : 8;
       const uncapturedFlags = [...neutralFlags, ...enemyFlags];
@@ -1084,95 +1179,121 @@ function doMoveAction(creep) {
 
   // ── P3: COMBAT — role-specific ────────────────────────────────────────
   if (role === ROLE_VANGUARD) {
-    // ** AGGRESSIVE PATHING ** — vanguards use aggressivePathOpts() so the
-    // influence map's enemy-threat field doesn't block them from closing to
-    // melee range. Previous pathOpts() added up to +200 cost near enemies,
-    // making it physically impossible to reach r1. Now vanguards path
-    // directly through enemy influence to engage.
+    // === ALWAYS ENGAGE ===
+    // Vanguards ALWAYS close to melee — they are the frontline.
+    // Medics follow THEM (M4 follows at r1). Vanguards NEVER wait for medics.
+    // doCombatAction handles the ATTACK action at r1.
+
     const inR1 = findInRange(creep, enemies, 1);
-    const inR5 = findInRange(creep, enemies, 5);
-    if (inR1.length > 0) {
-      const t = (globalFocusTarget && inR1.some(e => e.id === globalFocusTarget.id))
-        ? globalFocusTarget : selectFocusTarget(creep, inR1);
-      if (t) { creep.moveTo(t, aggressivePathOpts()); return; }
+    if (inR1.length > 0) return; // Melee contact — HOLD, doCombatAction attacks
+
+    const nearEn = findInRange(creep, enemies, 8);
+    if (nearEn.length > 0) {
+      const target = (globalFocusTarget && nearEn.some(e => e.id === globalFocusTarget.id))
+        ? globalFocusTarget
+        : findClosestByRange(creep, nearEn);
+      if (target) { creep.moveTo(target, aggressivePathOpts()); return; }
     }
-    if (inR5.length > 0) {
-      const t = selectFocusTarget(creep, inR5);
-      if (t) { creep.moveTo(t, aggressivePathOpts()); return; }
-    }
+    // No enemies in r8 — advance to objective aggressively
+    if (objective) { creep.moveTo(objective, aggressivePathOpts()); return; }
   }
 
   if (role === ROLE_RANGER) {
+    // Rangers: DPS dealers. Kite at r3, stay behind vanguard screen.
     const inR2 = findInRange(creep, enemies, 2);
     const inR3 = findInRange(creep, enemies, 3);
-    const inR5 = findInRange(creep, enemies, 5);
+    const inR6 = findInRange(creep, enemies, 6);
+    const vanguards = myCreeps.filter(c => creepRoles.get(c.id) === ROLE_VANGUARD);
+
     if (inR2.length > 0) {
-      const result = searchPath(
-        creep,
-        inR2.map(e => ({ pos: e, range: KITE_FLEE_RANGE })),
-        pathOpts(true),
-      );
-      if (result.path.length > 0) {
-        creep.move(getDirection(result.path[0].x - creep.x, result.path[0].y - creep.y));
-        return;
+      // Too close — step toward vanguard screen for body-block cover
+      const nearV = vanguards.length > 0 ? findClosestByRange(creep, vanguards) : null;
+      if (nearV && getRange(creep, nearV) > 1) {
+        creep.moveTo(nearV, pathOpts()); return;
       }
+      // No vanguards or already adjacent — flee toward squad centroid
+      const safePt = squadCentroid() || myFlag;
+      if (safePt) { creep.moveTo(safePt, pathOpts()); return; }
     }
-    if (inR3.length > 0) return;
-    if (inR5.length > 0) {
-      const t = selectFocusTarget(creep, inR5);
-      if (t) { creep.moveTo(t, pathOpts()); return; }
+    if (inR3.length > 0) return; // Perfect kite range — hold and shoot
+    if (inR6.length > 0) {
+      // Approach to r3 but stay behind vanguard screen
+      const nearestVan = vanguards.length > 0 ? findClosestByRange(creep, vanguards) : null;
+      const t = selectFocusTarget(creep, inR6);
+      if (t) {
+        if (nearestVan) {
+          const vanDistToEnemy = getRange(nearestVan, t);
+          const myDistToEnemy = getRange(creep, t);
+          if (myDistToEnemy > vanDistToEnemy) {
+            creep.moveTo(t, pathOpts()); return;
+          }
+          creep.moveTo(nearestVan, pathOpts()); return;
+        }
+        creep.moveTo(t, pathOpts()); return;
+      }
     }
   }
 
   if (role === ROLE_MEDIC) {
+    // Medics: tight heal support. Follow vanguards at r1.
+    // When allies are in combat, use aggressivePathOpts to NOT detour around
+    // the enemy threat field (which would leave vanguards to die unsupported).
     const allies = myCreeps.filter(c => c.id !== creep.id);
+    const vanguards = allies.filter(c => creepRoles.get(c.id) === ROLE_VANGUARD);
+    const alliesInCombat = allies.some(c => findInRange(c, enemies, 3).length > 0);
+    const moveOpts = alliesInCombat ? aggressivePathOpts() : pathOpts();
 
-    // M1: ally retreating → rush to range 1
-    const retreating = allies.filter(c => shouldPullBack(c) || shouldRetreat(c));
-    if (retreating.length > 0) {
-      const worst = retreating.reduce((b, c) =>
-        (c.hits / c.hitsMax) < (b.hits / b.hitsMax) ? c : b
-      );
-      if (getRange(creep, worst) > 1) { creep.moveTo(worst, pathOpts()); return; }
-      return;
-    }
-
-    // M2: critical ally (<50% HP) → chase to range 1
+    // M0: Critical ally (<50% HP) — rush to r1
     const critical = allies.filter(c => c.hits < c.hitsMax * 0.50);
     if (critical.length > 0) {
       const worst = critical.reduce((b, c) =>
         (c.hits / c.hitsMax) < (b.hits / b.hitsMax) ? c : b
       );
-      if (getRange(creep, worst) > 1) { creep.moveTo(worst, pathOpts()); return; }
+      if (getRange(creep, worst) > 1) { creep.moveTo(worst, aggressivePathOpts()); return; }
       return;
     }
 
-    // M3: damaged ally (<90% HP) → approach to range 3
+    // M1: Damaged ally within r3 — HOLD (doCombatAction handles rangedHeal)
+    const dmgInR3 = allies.filter(c => c.hits < c.hitsMax * 0.90 && getRange(creep, c) <= 3);
+    if (dmgInR3.length > 0) return;
+
+    // M2: Damaged ally beyond r3 — approach
     const damaged = allies.filter(c => c.hits < c.hitsMax * 0.90);
     if (damaged.length > 0) {
       const worst = damaged.reduce((b, c) =>
         (c.hits / c.hitsMax) < (b.hits / b.hitsMax) ? c : b
       );
-      if (getRange(creep, worst) > 3) { creep.moveTo(worst, pathOpts()); return; }
-      return;
+      creep.moveTo(worst, moveOpts); return;
     }
 
-    // M4: all healthy — follow nearest combat ally (within 3 tiles)
-    const combatAllies = allies.filter(c => {
-      const r = creepRoles.get(c.id);
-      return r === ROLE_VANGUARD || r === ROLE_RANGER;
-    });
+    // M3: Follow nearest vanguard at r1 — TIGHT formation
+    if (vanguards.length > 0) {
+      const nearest = findClosestByRange(creep, vanguards);
+      if (nearest && getRange(creep, nearest) > 1) {
+        creep.moveTo(nearest, moveOpts); return;
+      }
+      return; // At r1 of vanguard — hold and heal
+    }
+
+    // No vanguards — follow nearest combat ally at r2
+    const combatAllies = allies.filter(c => creepRoles.get(c.id) === ROLE_RANGER);
     if (combatAllies.length > 0) {
       const nearest = findClosestByRange(creep, combatAllies);
-      if (nearest && getRange(creep, nearest) > 3) {
-        creep.moveTo(nearest, pathOpts()); return;
+      if (nearest && getRange(creep, nearest) > 2) {
+        creep.moveTo(nearest, moveOpts); return;
       }
     }
     // Fall through to P4
   }
 
   // ── P4: Advance to objective ─────────────────────────────────────────
-  if (objective) { creep.moveTo(objective, pathOpts()); return; }
+  // Vanguards use aggressive pathing (they ARE the frontline).
+  // Others use influence-aware pathing for safety.
+  if (objective) {
+    const opts = (role === ROLE_VANGUARD) ? aggressivePathOpts() : pathOpts();
+    creep.moveTo(objective, opts);
+    return;
+  }
 
   // ── P5: Collect body parts (idle behavior, lowest priority) ──────────
   if (bodyParts.length > 0) {
@@ -1286,11 +1407,24 @@ function tickLog() {
   const chargerCount = chargerToTower.size;
   const mosquitoCount = myCreeps.filter(c => isMosquitoSituation(c)).length;
 
+  // Runner target info
+  const runnerInfo = myCreeps
+    .filter(c => creepRoles.get(c.id) === ROLE_RUNNER)
+    .map(c => {
+      const t = creepTargets.get(c.id);
+      return t ? `(${t.x},${t.y})` : '(?)';
+    }).join(' ');
+
+  // Enemy centroid
+  const ec = findEnemyCentroid();
+  const ecStr = ec ? `(${ec.x},${ec.y})` : 'none';
+
   console.log(
     `[T${tick}] CPU=${cpu}ms alive=${myCreeps.length} enemies=${enemies.length}` +
     ` flags(my=${myF} en=${enF} neu=${neuF})` +
     ` towers=[${towerStatus}] chargers=${chargerCount}` +
     ` mosquito=${mosquitoCount}` +
+    ` runners=[${runnerInfo}] enemyCenter=${ecStr}` +
     ` roles=${JSON.stringify(roles)}`
   );
 }
@@ -1320,10 +1454,11 @@ function drawVisuals() {
   const vis = new Visual(1, false);
   for (const creep of myCreeps) {
     if (creep.spawning) continue;
-    const role = (creepRoles.get(creep.id) || '?')[0].toUpperCase();
+    const roleId = creepRoles.get(creep.id) || '?';
+    const label = roleId === ROLE_RUNNER ? 'F' : roleId[0].toUpperCase();
     const hpRatio = creep.hits / creep.hitsMax;
     const color = hpRatio > 0.6 ? '#00ff88' : hpRatio > 0.3 ? '#ffaa00' : '#ff3333';
-    vis.text(role, { x: creep.x, y: creep.y - 0.6 }, { font: '0.4', color: '#ffffff', opacity: 0.85 });
+    vis.text(label, { x: creep.x, y: creep.y - 0.6 }, { font: '0.4', color: '#ffffff', opacity: 0.85 });
     // HP bar
     vis.rect({ x: creep.x - 0.5, y: creep.y + 0.4 }, 1, 0.15, { fill: '#333333', opacity: 0.7, stroke: undefined });
     vis.rect({ x: creep.x - 0.5, y: creep.y + 0.4 }, hpRatio, 0.15, { fill: color, opacity: 0.9, stroke: undefined });
@@ -1357,7 +1492,8 @@ function dumpEndGameDiag() {
   const totalIdle = Object.values(diag.idleTicks).reduce((a,b)=>a+b,0);
 
   console.log('=== CTF END-OF-MATCH DIAGNOSTICS ===');
-  console.log(`Tick: ${tick} | Survivors: ${myCreeps.length} | Flags: my=${myF} enemy=${enF} neutral=${neuF}`);
+  console.log(`Tick: ${tick} | Survivors: ${myCreeps.length} | Enemies: ${enemies.length}`);
+  console.log(`Flags: my=${myF} enemy=${enF} neutral=${neuF}`);
   console.log(`Start roster: ${JSON.stringify(diag.startRoster)}`);
   console.log(`Death events (${diag.deathEvents.length}): ` + diag.deathEvents.map(e => `T${e.tick}:${e.role}`).join(' | '));
   console.log(`Flag events (${diag.flagEvents.length}): ` + diag.flagEvents.map(e => `T${e.tick}:${e.type}`).join(' | '));
@@ -1365,7 +1501,16 @@ function dumpEndGameDiag() {
   console.log(`CPU samples: avg=${cpuAvg}ms max=${cpuMax}ms over ${diag.cpuSamples.length} intervals`);
   console.log('Action counts by role:');
   for (const [role, counts] of Object.entries(diag.actionCounts)) {
-    console.log(`  ${role}: ${JSON.stringify(counts)}`);
+    const total = Object.values(counts).reduce((a, b) => a + b, 0);
+    const atkPct = total > 0 ? ((counts.attack / total) * 100).toFixed(1) : '0.0';
+    console.log(`  ${role}: ${JSON.stringify(counts)} (atk%=${atkPct})`);
+  }
+  // Per-survivor summary
+  console.log('Survivors:');
+  for (const creep of myCreeps) {
+    const r = creepRoles.get(creep.id) || '?';
+    const hpPct = ((creep.hits / creep.hitsMax) * 100).toFixed(0);
+    console.log(`  ${r} hp=${hpPct}% pos=(${creep.x},${creep.y})`);
   }
   console.log('=== END DIAGNOSTICS ===');
 }
