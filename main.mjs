@@ -573,10 +573,13 @@ function commandLayer() {
   // Re-evaluate early only if: sticky flag captured, lost, or gone.
   let objective = null;
 
+  // When dominant, reduce stickiness to react faster to flag flips
+  const effectiveSticky = (myCreeps.length >= enemies.length * 2) ? 10 : STICKY_TICKS;
+
   // Check if sticky objective is still valid
   const stickyStillValid = stickyObjective &&
     uncaptured.some(f => f.id === stickyObjective.id) &&
-    (tick - stickySetTick) < STICKY_TICKS;
+    (tick - stickySetTick) < effectiveSticky;
 
   if (stickyStillValid) {
     objective = uncaptured.find(f => f.id === stickyObjective.id);
@@ -596,16 +599,57 @@ function commandLayer() {
     stickyObjective = null;
   }
 
-  for (const creep of myCreeps) {
-    if (chargerToTower.has(creep.id)) continue;
-    creepTargets.set(creep.id, objective);
+  // ── DOMINANT MULTI-SWEEP — capture multiple flags in parallel ────────────
+  // When we massively outnumber the enemy, one deathball is wasteful.
+  // Split into groups to sweep all uncaptured flags simultaneously.
+  const dominant = myCreeps.length >= enemies.length * 2 && enemies.length > 0;
+  const availableCreeps = myCreeps.filter(c => !chargerToTower.has(c.id));
+
+  if (dominant && uncaptured.length > 1) {
+    // Sort uncaptured by distance to centroid for efficient sweep
+    const sorted = uncaptured.slice().sort((a, b) =>
+      getRange(centroid, a) - getRange(centroid, b)
+    );
+    // Assign creeps round-robin across flags, weighted toward nearest
+    for (let i = 0; i < availableCreeps.length; i++) {
+      const flag = sorted[i % sorted.length];
+      creepTargets.set(availableCreeps[i].id, flag);
+    }
+  } else {
+    for (const creep of availableCreeps) {
+      creepTargets.set(creep.id, objective);
+    }
+  }
+
+  // ── FLAG DEFENSE INTERCEPTOR — anti-rush & anti-sneak ──────────────────
+  // Scan for enemies near OUR captured flags. If a flag is undefended and
+  // threatened, redirect the CLOSEST combat creep to intercept.
+  // This stops lone scouts from flipping flags behind our lines.
+  const myOwnedFlags = allFlags.filter(f => f.my === true);
+  for (const flag of myOwnedFlags) {
+    const threatsNearFlag = findInRange(flag, enemies, 10);
+    if (threatsNearFlag.length === 0) continue;
+    // Already defended? Check if any ally is within 5 tiles
+    const defendersNear = findInRange(flag, myCreeps, 5).filter(c =>
+      !chargerToTower.has(c.id)
+    );
+    if (defendersNear.length > 0) continue;
+    // Redirect closest combat creep to intercept
+    const interceptors = myCreeps.filter(c => {
+      const r = creepRoles.get(c.id);
+      return (r === ROLE_VANGUARD || r === ROLE_RANGER) && !chargerToTower.has(c.id);
+    });
+    if (interceptors.length === 0) continue;
+    const closest = findClosestByRange(flag, interceptors);
+    if (closest) creepTargets.set(closest.id, flag);
   }
 
   // ── STRAGGLER CONSOLIDATION ──────────────────────────────────────────────
   // After Phase 1 parallel rush, the force is often physically split. Creeps
   // far from the team centroid that face nearby enemies should merge with the
   // main group BEFORE walking solo into the enemy deathball.
-  if (centroid) {
+  // Skip when dominant — stragglers are sweeping flags intentionally.
+  if (centroid && !dominant) {
     for (const creep of myCreeps) {
       if (chargerToTower.has(creep.id)) continue;
       const distToCentroid = getRange(creep, centroid);
@@ -652,24 +696,42 @@ function squadCentroid() {
 }
 
 /**
- * Mosquito detection: is this creep in a locally-outnumbered situation
+ * Mosquito detection: is this creep in a genuinely-outnumbered small group
  * where it should kite toward allied mass instead of fighting?
- * Triggers when: outnumbered locally, or at parity with split force.
- * Does NOT trigger when the full force faces the enemy (no one to merge with).
+ *
+ * Conservative triggers — prevents the whole-army-fleeing cascade:
+ * 1. NEVER triggers if this creep is part of the main army (≥60% of alive)
+ * 2. NEVER triggers if we have global numerical dominance (≥1.5x)
+ * 3. Only on genuine numeric disadvantage (enemies > allies * 1.3)
  */
 function isMosquitoSituation(creep) {
   const localAllies  = findInRange(creep, myCreeps, MOSQUITO_DETECT_RANGE).length;
   const localEnemies = findInRange(creep, enemies, MOSQUITO_DETECT_RANGE).length;
-  if (localEnemies < 3) return false;  // too few enemies to worry about
+  if (localEnemies < 3) return false;
 
-  // Clearly outnumbered locally → mosquito
-  if (localEnemies > localAllies) return true;
+  // Main army check: if ≥50% of our force is here, this IS the main fight — commit.
+  // Prevents the whole-army-fleeing cascade where both halves of a split force flee.
+  if (localAllies >= myCreeps.length * 0.5) return false;
 
-  // At parity but force is split (far allies exist to merge with) → mosquito
-  const farAllies = myCreeps.filter(c =>
-    c.id !== creep.id && getRange(creep, c) > MOSQUITO_DETECT_RANGE
-  );
-  return localEnemies >= localAllies && farAllies.length >= 2;
+  // Global dominance: if we outnumber enemy overall by 1.5x, always fight
+  if (myCreeps.length >= enemies.length * 1.5) return false;
+
+  // Trigger only on genuine disadvantage (50%+ more enemies locally)
+  return localEnemies > localAllies * 1.5;
+}
+
+/**
+ * Combat strength estimate for a group of creeps.
+ * Used for opportunity aggression detection.
+ */
+function groupStrength(creeps) {
+  let str = 0;
+  for (const c of creeps) {
+    str += countActive(c, ATTACK) * ATTACK_POWER;
+    str += countActive(c, RANGED_ATTACK) * RANGED_ATTACK_POWER;
+    str += countActive(c, HEAL) * HEAL_POWER;
+  }
+  return str;
 }
 
 /**
@@ -951,23 +1013,27 @@ function doMoveAction(creep) {
   if (bodyParts.some(b => b.x === creep.x && b.y === creep.y)) return;
 
   // ── P1.5: MOSQUITO KITE-BACK — sustain & kite toward allied mass ─────
-  // Locally outnumbered? REFUSE to engage. Kite toward the far allied cluster
-  // to merge forces. If universally outnumbered, fall back to tower/flag cover.
-  // ALL roles participate uniformly. DPS & healing sustained by doCombatAction.
-  // Priority: ZERO deaths in disadvantaged situations.
+  // Genuinely outnumbered small group? Walk toward allies or tower cover.
+  // Conservative: main army and dominant forces NEVER trigger this.
+  //
+  // CRITICAL: NO searchPath(flee) here. flee=true + influence map penalties
+  // create conflicting forces that trap creeps in corners/swamps/dead-ends.
+  // Instead, ALWAYS moveTo(safePoint) — the pathfinder routes AROUND enemy
+  // clusters while heading toward the real destination (allied centroid).
+  // This inherently kites away from the deathball because allies are on the
+  // opposite side of the map.
   if (isMosquitoSituation(creep)) {
     const farAllies = myCreeps.filter(c =>
       c.id !== creep.id && getRange(creep, c) > MOSQUITO_DETECT_RANGE
     );
 
-    // Determine kite target: far allies centroid or fallback to tower/flag
     let safePoint = null;
     if (farAllies.length >= 1) {
       const cx = Math.round(farAllies.reduce((s, c) => s + c.x, 0) / farAllies.length);
       const cy = Math.round(farAllies.reduce((s, c) => s + c.y, 0) / farAllies.length);
       safePoint = { x: cx, y: cy };
     } else {
-      // Universally outnumbered — fall back under tower / flag cover
+      // No far allies — universally outnumbered. Fall back to tower or own flag.
       const activeTower = myTowers.find(t =>
         t.store && t.store.getUsedCapacity(RESOURCE_ENERGY) > 0
       );
@@ -975,24 +1041,27 @@ function doMoveAction(creep) {
     }
 
     if (safePoint) {
-      // Enemies within MOSQUITO_FLEE_RANGE → flee for immediate safety
-      const nearEn = findInRange(creep, enemies, MOSQUITO_FLEE_RANGE);
-      if (nearEn.length > 0) {
-        const result = searchPath(
-          creep,
-          nearEn.map(e => ({ pos: e, range: MOSQUITO_FLEE_RANGE + 3 })),
-          pathOpts(true),
-        );
-        if (result.path.length > 0) {
-          creep.move(getDirection(result.path[0].x - creep.x, result.path[0].y - creep.y));
-          return;
-        }
-      }
-      // No immediate threat or flee failed → path toward safe point
       creep.moveTo(safePoint, pathOpts());
       return;
     }
-    // No safe point → fall through to normal combat behavior
+  }
+
+  // ── P1.7: OPPORTUNITY AGGRESSION — pursue weak enemy groups ───────────
+  // If we have decisive local superiority, chase and destroy.
+  // This catches enemy scouts/runners passing near our force.
+  if (role === ROLE_VANGUARD || role === ROLE_RANGER) {
+    const localAllies  = findInRange(creep, myCreeps, 8);
+    const localEnemies = findInRange(creep, enemies, 10);
+    if (localEnemies.length > 0 && localEnemies.length <= 3 &&
+        groupStrength(localAllies) > groupStrength(localEnemies) * 2) {
+      // Decisive advantage — hunt them down
+      const target = selectFocusTarget(creep, localEnemies);
+      if (target) {
+        const opts = role === ROLE_VANGUARD ? aggressivePathOpts() : pathOpts();
+        creep.moveTo(target, opts);
+        return;
+      }
+    }
   }
 
   // ── P2: FLAG CAPTURE — go capture nearby uncaptured flag ──────────────
