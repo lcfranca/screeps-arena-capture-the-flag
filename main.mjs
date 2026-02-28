@@ -102,6 +102,13 @@ let influenceMatrix    = null;
 let lastInfluenceTick  = -Infinity;
 let initialized        = false;
 
+// ─── OBJECTIVE STICKINESS ─────────────────────────────────────────────────────
+// Prevents oscillation: once committed to a flag, lock for STICKY_TICKS before
+// re-evaluating. Resets on flag capture/loss or if objective disappears.
+let stickyObjective    = null;   // the flag object
+let stickySetTick      = -Infinity;
+const STICKY_TICKS     = 40;
+
 // ─── DIAGNOSTIC / METRICS STATE ────────────────────────────────────────────────
 const diag = {
   startRoster:      null,    // snapshot of initial role counts
@@ -427,6 +434,19 @@ function pathOpts(flee = false) {
   };
 }
 
+/**
+ * Aggressive pathing for melee engagements.
+ * Omits enemy threat field so vanguards can actually close to melee range.
+ * Still respects terrain costs (swamp/plain).
+ */
+function aggressivePathOpts() {
+  return {
+    plainCost: 2,
+    swampCost: 10,
+    maxOps: 2000,
+  };
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  6 · PHASE CONTROLLER
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -530,7 +550,7 @@ function commandLayer() {
         const gy = Math.round(groupCreeps.reduce((s, c) => s + c.y, 0) / groupCreeps.length);
         const nearEn = findInRange({ x: gx, y: gy }, enemies, 12).length;
 
-        if (nearEn > groupCreeps.length + 2) {
+        if (nearEn > groupCreeps.length * 1.5 && nearEn >= 3) {
           // This group is outmatched — regroup EVERYONE to the safer flag
           const safest = neutralFlags.reduce((best, f) => {
             const enA = findInRange(f, enemies, 12).length;
@@ -546,19 +566,32 @@ function commandLayer() {
     return;
   }
 
-  // ── Phase 2+: Single Objective ───────────────────────────────────────────
-  // Pick uncaptured flag with FEWEST enemy defenders (avoid deathball).
-  // Tiebreak: closest to squad centroid.
+  // ── Phase 2+: Single Objective with STICKINESS ───────────────────────────
+  // Prevents oscillation: once committed, hold for STICKY_TICKS.
+  // Re-evaluate early only if: sticky flag captured, lost, or gone.
   let objective = null;
-  if (uncaptured.length > 0) {
+
+  // Check if sticky objective is still valid
+  const stickyStillValid = stickyObjective &&
+    uncaptured.some(f => f.id === stickyObjective.id) &&
+    (tick - stickySetTick) < STICKY_TICKS;
+
+  if (stickyStillValid) {
+    objective = uncaptured.find(f => f.id === stickyObjective.id);
+  } else if (uncaptured.length > 0) {
+    // Pick uncaptured flag with FEWEST enemy defenders.
+    // Tiebreak: closest to squad centroid.
     objective = uncaptured.reduce((best, f) => {
       const ef = findInRange(f, enemies, 8).length;
       const eb = findInRange(best, enemies, 8).length;
       if (ef !== eb) return ef < eb ? f : best;
       return getRange(centroid, f) <= getRange(centroid, best) ? f : best;
     });
+    stickyObjective = objective;
+    stickySetTick = tick;
   } else {
     objective = myFlag;
+    stickyObjective = null;
   }
 
   for (const creep of myCreeps) {
@@ -877,49 +910,91 @@ function doMoveAction(creep) {
   // ── P1: Body part on same tile — stay to auto-collect ─────────────────
   if (bodyParts.some(b => b.x === creep.x && b.y === creep.y)) return;
 
-  // ── P1.5: OUTNUMBERED RETREAT — regroup with main force ──────────────
-  // If locally outnumbered (enemies in r7 > allies in r7 + 2), don't
-  // engage — fall back toward the largest cluster of far allies.
-  // This prevents isolated sub-groups from being destroyed piecemeal.
-  if (role !== ROLE_MEDIC) {
-    const localAllies  = findInRange(creep, myCreeps, 7).length;  // includes self
-    const localEnemies = findInRange(creep, enemies, 7).length;
-    if (localEnemies > localAllies + 2 && localEnemies >= 3) {
-      const farAllies = myCreeps.filter(c => c.id !== creep.id && getRange(creep, c) > 7);
-      if (farAllies.length >= 2) {
+  // ── P1.5: OUTNUMBERED KITE-BACK — fighting retreat toward allies ─────
+  // If locally outnumbered, kite-back toward nearest allied cluster.
+  // ALL roles participate (including medics—they must retreat WITH the group
+  // or they die alone after combat creeps flee).
+  // During kite-back, doCombatAction still fires ranged attacks/heals,
+  // so DPS and healing are sustained while retreating.
+  {
+    const localAllies  = findInRange(creep, myCreeps, 8).length;  // includes self
+    const localEnemies = findInRange(creep, enemies, 8).length;
+    // Trigger: outnumbered by 50% AND at least 3 enemies in zone.
+    // E.g. 5 allies vs 8 enemies (8 > 5*1.5=7.5) → kite back.
+    const outnumbered = localEnemies > localAllies * 1.5 && localEnemies >= 3;
+
+    if (outnumbered) {
+      // Find the nearest allied cluster center to kite TOWARD.
+      // Cluster = allies that are NOT in our local danger zone (>8 tiles away).
+      const farAllies = myCreeps.filter(c => c.id !== creep.id && getRange(creep, c) > 8);
+
+      if (farAllies.length >= 1) {
+        // Kite toward allied cluster centroid
         const cx = Math.round(farAllies.reduce((s, c) => s + c.x, 0) / farAllies.length);
         const cy = Math.round(farAllies.reduce((s, c) => s + c.y, 0) / farAllies.length);
-        creep.moveTo({ x: cx, y: cy }, pathOpts()); return;
+        const safePoint = { x: cx, y: cy };
+
+        if (role === ROLE_MEDIC) {
+          // Medics: move toward safe point while staying near their group
+          creep.moveTo(safePoint, pathOpts()); return;
+        }
+
+        // Combat creeps: if enemies in r2, flee toward safe point (kite)
+        const closeEnemies = findInRange(creep, enemies, 2);
+        if (closeEnemies.length > 0) {
+          // Compute flee direction biased toward safe point
+          const result = searchPath(
+            creep,
+            closeEnemies.map(e => ({ pos: e, range: 4 })),
+            pathOpts(true),
+          );
+          if (result.path.length > 0) {
+            creep.move(getDirection(result.path[0].x - creep.x, result.path[0].y - creep.y));
+            return;
+          }
+        }
+        // No immediate melee threat: walk toward safe point
+        creep.moveTo(safePoint, pathOpts()); return;
       }
+      // No far allies → hold ground (don't flee to nothing, better to fight)
     }
   }
 
   // ── P2: FLAG CAPTURE — go capture nearby uncaptured flag ──────────────
-  // Highest action priority after survival. Only when not in immediate combat.
-  // Medics use smaller radius to stay near combat allies.
-  if (findInRange(creep, enemies, 3).length === 0) {
-    const capRadius = role === ROLE_MEDIC ? 3 : 8;
-    const uncapturedFlags = [...neutralFlags, ...enemyFlags];
-    if (uncapturedFlags.length > 0) {
-      const nearest = findClosestByRange(creep, uncapturedFlags);
-      if (nearest && getRange(creep, nearest) <= capRadius) {
-        creep.moveTo(nearest); return;
+  // Only when not in combat range. Vanguards suppress if ANY enemy in r6
+  // (their engagement range) to avoid flag-detours during combat.
+  // Rangers/Medics suppress at r3 (they can kite/heal near flags).
+  {
+    const suppressR = role === ROLE_VANGUARD ? 6 : 3;
+    if (findInRange(creep, enemies, suppressR).length === 0) {
+      const capRadius = role === ROLE_MEDIC ? 3 : 8;
+      const uncapturedFlags = [...neutralFlags, ...enemyFlags];
+      if (uncapturedFlags.length > 0) {
+        const nearest = findClosestByRange(creep, uncapturedFlags);
+        if (nearest && getRange(creep, nearest) <= capRadius) {
+          creep.moveTo(nearest); return;
+        }
       }
     }
   }
 
   // ── P3: COMBAT — role-specific ────────────────────────────────────────
   if (role === ROLE_VANGUARD) {
+    // ** AGGRESSIVE PATHING ** — vanguards use aggressivePathOpts() so the
+    // influence map's enemy-threat field doesn't block them from closing to
+    // melee range. Previous pathOpts() added up to +200 cost near enemies,
+    // making it physically impossible to reach r1. Now vanguards path
+    // directly through enemy influence to engage.
     const inR1 = findInRange(creep, enemies, 1);
     const inR5 = findInRange(creep, enemies, 5);
     if (inR1.length > 0) {
       const t = (globalFocusTarget && inR1.some(e => e.id === globalFocusTarget.id))
         ? globalFocusTarget : selectFocusTarget(creep, inR1);
-      if (t) { creep.moveTo(t, pathOpts()); return; }
+      if (t) { creep.moveTo(t, aggressivePathOpts()); return; }
     }
     if (inR5.length > 0) {
       const t = selectFocusTarget(creep, inR5);
-      if (t) { creep.moveTo(t, pathOpts()); return; }
+      if (t) { creep.moveTo(t, aggressivePathOpts()); return; }
     }
   }
 
