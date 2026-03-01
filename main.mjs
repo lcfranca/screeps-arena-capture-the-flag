@@ -113,6 +113,9 @@ let stickyObjective    = null;   // the flag object
 let stickySetTick      = -Infinity;
 const STICKY_TICKS     = 40;
 
+// ── ENEMY VELOCITY TRACKING (for interception prediction) ────────────────────
+const enemyPrevPos = new Map(); // enemyId → {x, y} from last tick
+
 // ─── DIAGNOSTIC / METRICS STATE ────────────────────────────────────────────────
 const diag = {
   startRoster:      null,    // snapshot of initial role counts
@@ -141,6 +144,12 @@ let bodyParts     = [];
 let tick          = 0;
 // per-tick action tracking (for idle detection)
 const tickActions = new Map(); // creep.id → action string this tick
+
+// ── PRE-COMPUTED PER-TICK ROLE LISTS (populated by precomputeRoleLists) ─────
+let myVanguards = [];
+let myRangers   = [];
+let myMedics    = [];
+let myRunners   = [];
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  1 · SENSE LAYER — World State Refresh
@@ -338,7 +347,7 @@ function selectFocusTarget(fromPos, eligible) {
   if (eligible.length === 0) return null;
   if (eligible.length === 1) return eligible[0];
 
-  const myMedics = myCreeps.filter(c => creepRoles.get(c.id) === ROLE_MEDIC);
+  // G09: use pre-computed myMedics instead of filtering per call
   return eligible.slice().sort((a, b) => {
     // 0. Enemy threatening a medic (within 4 tiles) → eliminate first
     const aThreatsMedic = myMedics.some(m => getRange(a, m) <= 4);
@@ -470,6 +479,114 @@ function aggressivePathOpts() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+//  5b · MICRO MOVEMENT HELPERS — O(1), no pathfinding
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/** Move 1 tile TOWARD target. O(1) with wall fallback to moveTo. */
+function moveToward(creep, target) {
+  const dx = Math.sign(target.x - creep.x);
+  const dy = Math.sign(target.y - creep.y);
+  if (dx === 0 && dy === 0) return;
+  const nx = creep.x + dx;
+  const ny = creep.y + dy;
+  if (nx >= 0 && nx <= 99 && ny >= 0 && ny <= 99 &&
+      getTerrainAt({ x: nx, y: ny }) !== TERRAIN_WALL) {
+    creep.move(getDirection(dx, dy));
+  } else {
+    creep.moveTo(target);
+  }
+}
+
+/** Move 1 tile AWAY from threat. O(1) with wall fallback to searchPath flee. */
+function moveAway(creep, threat) {
+  const dx = Math.sign(creep.x - threat.x);
+  const dy = Math.sign(creep.y - threat.y);
+  // Only fall back to arbitrary direction when on same tile (both zero)
+  const fdx = (dx === 0 && dy === 0) ? 1 : dx;
+  const fdy = (dx === 0 && dy === 0) ? 0 : dy;
+  const nx = creep.x + fdx;
+  const ny = creep.y + fdy;
+  if (nx >= 0 && nx <= 99 && ny >= 0 && ny <= 99 &&
+      getTerrainAt({ x: nx, y: ny }) !== TERRAIN_WALL) {
+    creep.move(getDirection(fdx, fdy));
+  } else {
+    // Wall behind us — use pathfinder to find escape route
+    const result = searchPath(creep, [{ pos: threat, range: KITE_FLEE_RANGE }], pathOpts(true));
+    if (result.path.length > 0) {
+      creep.move(getDirection(result.path[0].x - creep.x, result.path[0].y - creep.y));
+    }
+  }
+}
+
+/** Pre-compute per-tick role lists. Eliminates ~40 redundant .filter() per tick. */
+function precomputeRoleLists() {
+  myVanguards = myCreeps.filter(c => creepRoles.get(c.id) === ROLE_VANGUARD);
+  myRangers   = myCreeps.filter(c => creepRoles.get(c.id) === ROLE_RANGER);
+  myMedics    = myCreeps.filter(c => creepRoles.get(c.id) === ROLE_MEDIC);
+  myRunners   = myCreeps.filter(c => creepRoles.get(c.id) === ROLE_RUNNER);
+}
+
+/** Track enemy velocity vectors for interception prediction. */
+function trackEnemyVelocity() {
+  for (const e of enemies) {
+    const prev = enemyPrevPos.get(e.id);
+    if (prev) {
+      e._vx = e.x - prev.x;
+      e._vy = e.y - prev.y;
+      e._px = Math.max(0, Math.min(99, e.x + e._vx));
+      e._py = Math.max(0, Math.min(99, e.y + e._vy));
+    } else {
+      e._vx = e._vy = 0;
+      e._px = e.x;
+      e._py = e.y;
+    }
+    enemyPrevPos.set(e.id, { x: e.x, y: e.y });
+  }
+  // Cleanup dead enemies
+  const aliveEnemyIds = new Set(enemies.map(e => e.id));
+  for (const id of enemyPrevPos.keys()) {
+    if (!aliveEnemyIds.has(id)) enemyPrevPos.delete(id);
+  }
+}
+
+/**
+ * Best ranged action: mass vs focused, based on enemy positions.
+ * G05: Proper threshold — ≥2 enemies at r1 triggers mass.
+ * Returns 'attack' if action taken, null otherwise.
+ */
+function bestRangedAction(creep, focusTarget) {
+  const inR1 = findInRange(creep, enemies, 1);
+  const inR3 = findInRange(creep, enemies, 3);
+  if (inR3.length === 0) return null;
+
+  // ≥2 enemies at r1 → mass is strictly better (2× DPS total)
+  if (inR1.length >= 2) {
+    creep.rangedMassAttack();
+    return 'attack';
+  }
+
+  // Calculate mass total vs focused damage
+  const N = countActive(creep, RANGED_ATTACK);
+  if (N === 0) return null;
+  const inR2 = findInRange(creep, enemies, 2);
+  const massTotal = inR1.length * 10 * N
+    + (inR2.length - inR1.length) * 4 * N
+    + (inR3.length - inR2.length) * 1 * N;
+  const focusedTotal = 10 * N;
+
+  if (massTotal > focusedTotal * 1.5) {
+    creep.rangedMassAttack();
+  } else {
+    const t = (focusTarget && inR3.some(e => e.id === focusTarget.id))
+      ? focusTarget
+      : (inR3.length === 1 ? inR3[0] : inR3.reduce((b, c) => c.hits < b.hits ? c : b));
+    if (t) creep.rangedAttack(t);
+    else return null;
+  }
+  return 'attack';
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 //  6 · PHASE CONTROLLER
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -489,11 +606,16 @@ function enemyFlagCount() { return allFlags.filter(f => f.my === false).length; 
 
 function shouldRetreat(creep) {
   if (creep.hits >= creep.hitsMax * RETREAT_HP_RATIO) return false;
+  // Theory §6.1: Vanguards NEVER retreat — they fight to death.
+  // Retreating removes melee DPS (180→0), exposes medics, and the retreat code
+  // in doCombatAction replaces attack() with heal(self) → complete DPS loss.
+  // "melhor morrer lutando"
+  const role = creepRoles.get(creep.id);
+  if (role === ROLE_VANGUARD) return false;
   // Only retreat if medics are alive to heal us at the rally point.
   // With no medics, retreating to myFlag is permanent — the creep idles forever
   // because HP never recovers. Better to hold and deal damage.
-  const medicsAlive = myCreeps.some(c => creepRoles.get(c.id) === ROLE_MEDIC);
-  return medicsAlive;
+  return myMedics.length > 0;
 }
 
 /**
@@ -505,10 +627,14 @@ function shouldPullBack(creep) {
   if (shouldRetreat(creep)) return false;                          // full retreat handles this
   const role = creepRoles.get(creep.id);
   if (role === ROLE_MEDIC) return false;
+  // G03: Vanguards NEVER pull back — they are expendable frontline.
+  // A vanguard retreating removes melee DPS and exposes the backline.
+  // Medics come to THEM, not the other way around.
+  if (role === ROLE_VANGUARD) return false;
   const ratio = creep.hits / creep.hitsMax;
   if (ratio > PULLBACK_HP_RATIO) return false;                     // still healthy
   // Suppress pull-back if a medic is already adjacent (healing happening)
-  return !myCreeps.some(c => creepRoles.get(c.id) === ROLE_MEDIC && getRange(creep, c) <= 1);
+  return !myMedics.some(m => getRange(creep, m) <= 1);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -524,15 +650,21 @@ function commandLayer() {
   const centroid = squadCentroid() || { x: 50, y: 50 };
 
   // ── Global focus target ──────────────────────────────────────────────────
-  globalFocusTarget = enemies.length > 0 ? selectFocusTarget(centroid, enemies) : null;
+  // Theory §7.1: Focus must be on enemies our troops can ACTUALLY reach.
+  // Without range filtering, focus can be 30+ tiles away → no convergence.
+  const engageable = enemies.filter(e =>
+    myVanguards.some(v => getRange(v, e) <= 6) ||
+    myRangers.some(r => getRange(r, e) <= 6)
+  );
+  globalFocusTarget = engageable.length > 0
+    ? selectFocusTarget(centroid, engageable)
+    : (enemies.length > 0 ? selectFocusTarget(centroid, enemies) : null);
 
   // ── Designate tank — picks healthiest vanguard for heal-ball formation ──
   designateTank();
 
   const uncaptured = [...neutralFlags, ...enemyFlags];
-  const runners = myCreeps.filter(c =>
-    creepRoles.get(c.id) === ROLE_RUNNER && !chargerToTower.has(c.id)
-  );
+  const runners = myRunners.filter(c => !chargerToTower.has(c.id));
   const mainArmy = myCreeps.filter(c => {
     const r = creepRoles.get(c.id);
     return r !== ROLE_RUNNER && !chargerToTower.has(c.id);
@@ -627,10 +759,7 @@ function recordAction(creep, action) {
  * Used by Medics and Rangers to stay near the fight.
  */
 function squadCentroid() {
-  const squad = myCreeps.filter(c => {
-    const r = creepRoles.get(c.id);
-    return r === ROLE_VANGUARD || r === ROLE_RANGER;
-  });
+  const squad = [...myVanguards, ...myRangers];
   if (squad.length === 0) return null;
   const ax = Math.round(squad.reduce((s, c) => s + c.x, 0) / squad.length);
   const ay = Math.round(squad.reduce((s, c) => s + c.y, 0) / squad.length);
@@ -652,11 +781,14 @@ function isMosquitoSituation(creep) {
   if (localEnemies < 3) return false;
 
   // Main army check: if ≥50% of our force is here, this IS the main fight — commit.
-  // Prevents the whole-army-fleeing cascade where both halves of a split force flee.
   if (localAllies >= myCreeps.length * 0.5) return false;
 
   // Global dominance: if we outnumber enemy overall by 1.5x, always fight
   if (myCreeps.length >= enemies.length * 1.5) return false;
+
+  // G15: If creep has vanguard support nearby, don't flee — screen is present
+  const localVanguards = findInRange(creep, myVanguards, 4);
+  if (localVanguards.length >= 2) return false;
 
   // Trigger only on genuine disadvantage (50%+ more enemies locally)
   return localEnemies > localAllies * 1.5;
@@ -682,9 +814,7 @@ function groupStrength(creeps) {
  * Called once per tick from commandLayer.
  */
 function designateTank() {
-  const vanguards = myCreeps.filter(c =>
-    creepRoles.get(c.id) === ROLE_VANGUARD && !chargerToTower.has(c.id)
-  );
+  const vanguards = myVanguards.filter(c => !chargerToTower.has(c.id));
   if (vanguards.length === 0) {
     currentTank = null;
     return;
@@ -705,13 +835,13 @@ function designateTank() {
 }
 
 /**
- * Compute the formation point for a medic: 3 tiles BEHIND the tank,
+ * Compute the formation point for a medic: 1 tile BEHIND the tank,
  * on the opposite side from the enemy threat centroid.
- * This is the core of the heal-ball micro.
+ * At 1 tile behind, medic is r1 from tank (heal 12/part) and r2 from enemy.
  */
 function getFormationPoint(tank) {
   // Enemy centroid (threat direction)
-  const nearEnemies = findInRange(tank, enemies, 10);
+  const nearEnemies = findInRange(tank, enemies, 6);
   if (nearEnemies.length === 0) return null; // no enemies = no need for formation
   
   const ex = nearEnemies.reduce((s, e) => s + e.x, 0) / nearEnemies.length;
@@ -722,9 +852,9 @@ function getFormationPoint(tank) {
   const dy = tank.y - ey;
   const mag = Math.sqrt(dx * dx + dy * dy) || 1;
   
-  // Formation point = 3 tiles behind tank (away from enemies)
-  const fx = Math.round(tank.x + (dx / mag) * 3);
-  const fy = Math.round(tank.y + (dy / mag) * 3);
+  // Formation point = 1 tile behind tank (away from enemies)
+  const fx = Math.round(tank.x + (dx / mag) * 1);
+  const fy = Math.round(tank.y + (dy / mag) * 1);
   
   // Clamp to arena bounds
   return {
@@ -946,12 +1076,7 @@ function doCombatAction(creep) {
   if (shouldRetreat(creep)) {
     if (hasActive(creep, HEAL)) { creep.heal(creep); return 'heal'; }
     if (hasActive(creep, RANGED_ATTACK)) {
-      const inR3 = findInRange(creep, enemies, 3);
-      if (inR3.length >= 3) { creep.rangedMassAttack(); return 'attack'; }
-      if (inR3.length > 0) {
-        const t = selectFocusTarget(creep, inR3);
-        if (t) { creep.rangedAttack(t); return 'attack'; }
-      }
+      return bestRangedAction(creep, globalFocusTarget);
     }
     return null;
   }
@@ -962,9 +1087,7 @@ function doCombatAction(creep) {
       creep.heal(creep); return 'heal';
     }
     if (hasActive(creep, RANGED_ATTACK)) {
-      const inR3 = findInRange(creep, enemies, 3);
-      if (inR3.length >= 3) { creep.rangedMassAttack(); return 'attack'; }
-      if (inR3.length > 0) { creep.rangedAttack(inR3[0]); return 'attack'; }
+      return bestRangedAction(creep, globalFocusTarget);
     }
     if (hasActive(creep, ATTACK)) {
       const adj = findInRange(creep, enemies, 1);
@@ -981,9 +1104,12 @@ function doCombatAction(creep) {
       const adjDmg  = findInRange(creep, damaged, 1);
       const nearDmg = findInRange(creep, damaged, 3);
 
-      // Prefer tank if it's damaged and in range (concentrate heals on focal point)
+      // Tank priority only when significantly damaged (<70% HP).
+      // Otherwise heal most critical ally by HP ratio — this ensures medics
+      // heal EACH OTHER when focused by enemy ranged fire instead of blindly
+      // topping off a 95% tank while a medic is at 40% HP.
       const tank = currentTank ? damaged.find(c => c.id === currentTank) : null;
-      if (tank) {
+      if (tank && (tank.hits / tank.hitsMax) < 0.70) {
         const tankDist = getRange(creep, tank);
         if (tankDist <= 1) { creep.heal(tank); return 'heal'; }
         if (tankDist <= 3) { creep.rangedHeal(tank); return 'heal'; }
@@ -1000,14 +1126,7 @@ function doCombatAction(creep) {
       }
       if (creep.hits < creep.hitsMax) { creep.heal(creep); return 'heal'; }
     }
-    // Nothing to heal → attack adjacent enemy
-    if (hasActive(creep, ATTACK)) {
-      const adj = findInRange(creep, enemies, 1);
-      if (adj.length > 0) {
-        const t = selectFocusTarget(creep, adj);
-        if (t) { creep.attack(t); return 'attack'; }
-      }
-    }
+    // Nothing to heal — medics don't attack, heal uptime is paramount
     return null;
   }
 
@@ -1015,29 +1134,22 @@ function doCombatAction(creep) {
   if (hasActive(creep, ATTACK)) {
     const adj = findInRange(creep, enemies, 1);
     if (adj.length > 0) {
-      // Prefer the global shared focus target to burst through enemy heals
+      // G09: use globalFocusTarget directly, fallback to lowest HP (no sort)
       const t = (globalFocusTarget && adj.some(e => e.id === globalFocusTarget.id))
         ? globalFocusTarget
-        : selectFocusTarget(creep, adj);
-      if (t) { creep.attack(t); return 'attack'; }
+        : adj.reduce((b, c) => c.hits < b.hits ? c : b);
+      creep.attack(t); return 'attack';
     }
   }
   if (hasActive(creep, RANGED_ATTACK)) {
-    const inR3 = findInRange(creep, enemies, 3);
-    if (inR3.length > 0) {
-      if (inR3.length >= 3) { creep.rangedMassAttack(); return 'attack'; }
-      // Prefer global focus target; fall back to individual selection
-      const t = (globalFocusTarget && inR3.some(e => e.id === globalFocusTarget.id))
-        ? globalFocusTarget
-        : selectFocusTarget(creep, inR3);
-      if (t) { creep.rangedAttack(t); return 'attack'; }
-    }
+    // G05: use bestRangedAction for proper mass vs focused decision
+    const act = bestRangedAction(creep, globalFocusTarget);
+    if (act) return act;
   }
   // Opportunistic: heal an adjacent ally or self if idle
   if (hasActive(creep, HEAL)) {
-    const damaged = myCreeps.filter(c => c.hits < c.hitsMax);
-    const adj = findInRange(creep, damaged, 1);
-    if (adj.length > 0) { creep.heal(adj.reduce((b, c) => c.hits < b.hits ? c : b)); return 'heal'; }
+    const adjDmg = findInRange(creep, myCreeps.filter(c => c.hits < c.hitsMax), 1);
+    if (adjDmg.length > 0) { creep.heal(adjDmg.reduce((b, c) => c.hits < b.hits ? c : b)); return 'heal'; }
     if (creep.hits < creep.hitsMax) { creep.heal(creep); return 'heal'; }
   }
   return null;
@@ -1057,6 +1169,10 @@ function doMoveAction(creep) {
   const role = creepRoles.get(creep.id);
   const objective = creepTargets.get(creep.id);
 
+  // ── G02: FATIGUE GATE — skip ALL movement if creep can't move ────────────
+  // moveTo()/move() return ERR_TIRED when fatigued, wasting pathfinding CPU.
+  if (creep.fatigue > 0) return;
+
   // ── P0: Emergency retreat ────────────────────────────────────────────────
   if (shouldRetreat(creep)) {
     const nearby = findInRange(creep, enemies, 8);
@@ -1071,7 +1187,7 @@ function doMoveAction(creep) {
         return;
       }
     }
-    const medics = myCreeps.filter(c => creepRoles.get(c.id) === ROLE_MEDIC);
+    const medics = myMedics;
     if (medics.length > 0) {
       const nearest = findClosestByRange(creep, medics);
       if (nearest) { creep.moveTo(nearest, pathOpts()); return; }
@@ -1096,12 +1212,13 @@ function doMoveAction(creep) {
   }
 
   // ── P0.5: Soft pull-back — step toward nearest medic for heal ────────────
+  // G03: Only rangers pull back (vanguards NEVER pull back — see shouldPullBack)
   if (shouldPullBack(creep)) {
-    const medics = myCreeps.filter(c => creepRoles.get(c.id) === ROLE_MEDIC);
-    if (medics.length > 0) {
-      const nearest = findClosestByRange(creep, medics);
+    if (myMedics.length > 0) {
+      const nearest = findClosestByRange(creep, myMedics);
       if (nearest && getRange(creep, nearest) > 1) {
-        creep.moveTo(nearest, pathOpts()); return;
+        creep.moveTo(nearest, pathOpts());
+        return;
       }
     }
     // No medics or already adjacent — keep fighting
@@ -1120,7 +1237,9 @@ function doMoveAction(creep) {
   // clusters while heading toward the real destination (allied centroid).
   // This inherently kites away from the deathball because allies are on the
   // opposite side of the map.
-  if (isMosquitoSituation(creep)) {
+  // Medics NEVER flee via mosquito — they follow their healing target.
+  // If the vanguard retreats, the medic follows naturally via M3.
+  if (role !== ROLE_MEDIC && isMosquitoSituation(creep)) {
     const farAllies = myCreeps.filter(c =>
       c.id !== creep.id && getRange(creep, c) > MOSQUITO_DETECT_RANGE
     );
@@ -1144,118 +1263,148 @@ function doMoveAction(creep) {
     }
   }
 
-  // ── P1.7: OPPORTUNITY AGGRESSION — pursue weak enemy groups ───────────
-  // Only RANGERS chase scouts. Vanguards NEVER chase — they hold the screen.
-  if (role === ROLE_RANGER) {
-    const localAllies  = findInRange(creep, myCreeps, 8);
-    const localEnemies = findInRange(creep, enemies, 10);
-    if (localEnemies.length > 0 && localEnemies.length <= 3 &&
-        groupStrength(localAllies) > groupStrength(localEnemies) * 2) {
-      const target = selectFocusTarget(creep, localEnemies);
-      if (target) {
-        creep.moveTo(target, pathOpts());
-        return;
-      }
-    }
-  }
+  // ── P1.7: removed — opportunity aggression was splitting rangers from squad ──
 
-  // ── P2: FLAG CAPTURE — go capture nearby uncaptured flag ──────────────
-  // Only when not in combat range. Vanguards suppress if ANY enemy in r6
-  // (their engagement range) to avoid flag-detours during combat.
-  // Rangers/Medics suppress at r3 (they can kite/heal near flags).
-  {
-    const suppressR = role === ROLE_VANGUARD ? 8 : 3;
-    if (findInRange(creep, enemies, suppressR).length === 0) {
-      const capRadius = role === ROLE_MEDIC ? 3 : 8;
-      const uncapturedFlags = [...neutralFlags, ...enemyFlags];
-      if (uncapturedFlags.length > 0) {
-        const nearest = findClosestByRange(creep, uncapturedFlags);
-        if (nearest && getRange(creep, nearest) <= capRadius) {
-          creep.moveTo(nearest); return;
-        }
-      }
-    }
-  }
+  // ── P2: FLAG CAPTURE — ONLY RUNNERS capture flags ──────────────────
+  // Combat units (V/R/M) NEVER divert to capture flags.
+  // Theory: every tick a combat unit spends walking to a flag is DPS/HPS lost.
+  // Runners handle all flag objectives via commandLayer.
+  // (Combat units still auto-capture if they happen to walk over a flag)
 
   // ── P3: COMBAT — role-specific ────────────────────────────────────────
   if (role === ROLE_VANGUARD) {
-    // === ALWAYS ENGAGE ===
-    // Vanguards ALWAYS close to melee — they are the frontline.
-    // Medics follow THEM (M4 follows at r1). Vanguards NEVER wait for medics.
-    // doCombatAction handles the ATTACK action at r1.
+    // === VANGUARD: ALL charge focus target independently ===
+    // Theory §10.3: "Vanguards simplesmente avançam direto para o inimigo.
+    // A formação emerge naturalmente." No tank/follower split for movement.
+    // Tank designation remains for MEDIC HEAL PRIORITY only.
+    //
+    // Theory §5.3: MOVE + ATTACK are parallel slots, both fire same tick.
+    // At r1: moveToward(target) chases if enemy retreats. Blocked move = no harm.
 
     const inR1 = findInRange(creep, enemies, 1);
-    if (inR1.length > 0) return; // Melee contact — HOLD, doCombatAction attacks
+    if (inR1.length > 0) {
+      // Melee contact — doCombatAction already fired attack().
+      // Use MOVE slot to chase target in case it retreats this tick.
+      // If target stays, move fails (occupied tile) — no cost.
+      const target = (globalFocusTarget && inR1.some(e => e.id === globalFocusTarget.id))
+        ? globalFocusTarget
+        : findClosestByRange(creep, inR1);
+      if (target) moveToward(creep, target);
+      return;
+    }
 
+    // r2-r8: charge directly
     const nearEn = findInRange(creep, enemies, 8);
     if (nearEn.length > 0) {
       const target = (globalFocusTarget && nearEn.some(e => e.id === globalFocusTarget.id))
         ? globalFocusTarget
         : findClosestByRange(creep, nearEn);
-      if (target) { creep.moveTo(target, aggressivePathOpts()); return; }
+      if (target) {
+        if (getRange(creep, target) <= 2) {
+          moveToward(creep, target); // O(1), no pathfinding
+        } else {
+          creep.moveTo(target, aggressivePathOpts());
+        }
+        return;
+      }
     }
-    // No enemies in r8 — advance to objective aggressively
     if (objective) { creep.moveTo(objective, aggressivePathOpts()); return; }
   }
 
   if (role === ROLE_RANGER) {
     // Rangers: DPS dealers. Kite at r3, stay behind vanguard screen.
+    const inR1 = findInRange(creep, enemies, 1);
     const inR2 = findInRange(creep, enemies, 2);
     const inR3 = findInRange(creep, enemies, 3);
     const inR6 = findInRange(creep, enemies, 6);
-    const vanguards = myCreeps.filter(c => creepRoles.get(c.id) === ROLE_VANGUARD);
 
+    if (inR1.length > 0) {
+      // G10: Melee threat — kite with move(dir), O(1)
+      moveAway(creep, findClosestByRange(creep, inR1));
+      return;
+    }
     if (inR2.length > 0) {
-      // Too close — step toward vanguard screen for body-block cover
-      const nearV = vanguards.length > 0 ? findClosestByRange(creep, vanguards) : null;
-      if (nearV && getRange(creep, nearV) > 1) {
-        creep.moveTo(nearV, pathOpts()); return;
-      }
-      // No vanguards or already adjacent — flee toward squad centroid
-      const safePt = squadCentroid() || myFlag;
-      if (safePt) { creep.moveTo(safePt, pathOpts()); return; }
+      // G11: No melee at r1 — HOLD at r2 (rangedAttack does full damage at r2)
+      return;
     }
     if (inR3.length > 0) return; // Perfect kite range — hold and shoot
     if (inR6.length > 0) {
-      // Approach to r3 but stay behind vanguard screen
-      const nearestVan = vanguards.length > 0 ? findClosestByRange(creep, vanguards) : null;
-      const t = selectFocusTarget(creep, inR6);
+      // Approach to r3 — stay behind vanguard screen
+      const nearestVan = myVanguards.length > 0 ? findClosestByRange(creep, myVanguards) : null;
+      const t = globalFocusTarget && inR6.some(e => e.id === globalFocusTarget.id)
+        ? globalFocusTarget
+        : findClosestByRange(creep, inR6);
       if (t) {
         if (nearestVan) {
           const vanDistToEnemy = getRange(nearestVan, t);
           const myDistToEnemy = getRange(creep, t);
           if (myDistToEnemy > vanDistToEnemy) {
-            creep.moveTo(t, pathOpts()); return;
+            // Behind screen — safe to approach
+            creep.moveTo(t, aggressivePathOpts()); return;
           }
-          creep.moveTo(nearestVan, pathOpts()); return;
+          // Ahead of screen — follow vanguard (stay grouped)
+          if (getRange(creep, nearestVan) <= 2) {
+            moveToward(creep, nearestVan);
+          } else {
+            creep.moveTo(nearestVan, aggressivePathOpts());
+          }
+          return;
         }
-        creep.moveTo(t, pathOpts()); return;
+        creep.moveTo(t, aggressivePathOpts()); return;
       }
     }
   }
 
   if (role === ROLE_MEDIC) {
-    // Medics: tight heal support. Follow vanguards at r1.
-    // When allies are in combat, use aggressivePathOpts to NOT detour around
-    // the enemy threat field (which would leave vanguards to die unsupported).
-    const allies = myCreeps.filter(c => c.id !== creep.id);
-    const vanguards = allies.filter(c => creepRoles.get(c.id) === ROLE_VANGUARD);
-    const alliesInCombat = allies.some(c => findInRange(c, enemies, 3).length > 0);
-    const moveOpts = alliesInCombat ? aggressivePathOpts() : pathOpts();
+    // Theory §10.4: Medic PROTECT — pre-emptive flee from MELEE threats at r1-2
+    // that bypass the vanguard screen. r1 = attacked THIS tick. r2 = attacked NEXT.
+    // Only ATTACK enemies (ranged can't be avoided — they hit at r1-3 regardless).
+    // Only triggers when vanguards exist (if all dead, medic stays to heal rangers).
+    // doCombatAction (COMBAT slot) already fired heal/rangedHeal in parallel.
+    const nearEn = findInRange(creep, enemies, 2);
+    if (nearEn.length > 0 && myVanguards.length > 0) {
+      const meleeThreats = nearEn.filter(e =>
+        hasActive(e, ATTACK) &&
+        !myVanguards.some(v => getRange(v, e) < getRange(creep, e))
+      );
+      if (meleeThreats.length > 0) {
+        moveAway(creep, findClosestByRange(creep, meleeThreats));
+        return;
+      }
+    }
 
-    // M0: Critical ally (<50% HP) — rush to r1
+    const allies = myCreeps.filter(c => c.id !== creep.id);
+    // Medics ALWAYS use aggressivePathOpts when following combat allies.
+    // Using pathOpts() routes medics AROUND enemy threat field while vanguards
+    // charge THROUGH it → separation → vanguards die unsustained.
+    const moveOpts = aggressivePathOpts();
+
+    // M0: Critical ally (<50% HP) — rush to r1 (always use moveTo for reliability)
     const critical = allies.filter(c => c.hits < c.hitsMax * 0.50);
     if (critical.length > 0) {
       const worst = critical.reduce((b, c) =>
         (c.hits / c.hitsMax) < (b.hits / b.hitsMax) ? c : b
       );
-      if (getRange(creep, worst) > 1) { creep.moveTo(worst, aggressivePathOpts()); return; }
+      if (getRange(creep, worst) > 1) {
+        creep.moveTo(worst, aggressivePathOpts());
+        return;
+      }
       return;
     }
 
-    // M1: Damaged ally within r3 — HOLD (doCombatAction handles rangedHeal)
-    const dmgInR3 = allies.filter(c => c.hits < c.hitsMax * 0.90 && getRange(creep, c) <= 3);
-    if (dmgInR3.length > 0) return;
+    // M1: Damaged ally in r1 — HOLD for direct heal (12/part/tick)
+    const dmgInR1 = allies.filter(c => c.hits < c.hitsMax * 0.90 && getRange(creep, c) <= 1);
+    if (dmgInR1.length > 0) return;
+
+    // M1b: Damaged ally at r2-r3 — APPROACH to r1 for 3× heal throughput
+    // Theory §6.3: heal() = 12/part at r1 vs rangedHeal() = 4/part at r3.
+    // Holding at r3 wastes 67% of healing capacity.
+    const dmgInR3 = allies.filter(c => c.hits < c.hitsMax * 0.90 && getRange(creep, c) <= 3 && getRange(creep, c) > 1);
+    if (dmgInR3.length > 0) {
+      const worst = dmgInR3.reduce((b, c) => (c.hits/c.hitsMax) < (b.hits/b.hitsMax) ? c : b);
+      moveToward(creep, worst);
+      return;
+    }
 
     // M2: Damaged ally beyond r3 — approach
     const damaged = allies.filter(c => c.hits < c.hitsMax * 0.90);
@@ -1266,19 +1415,47 @@ function doMoveAction(creep) {
       creep.moveTo(worst, moveOpts); return;
     }
 
-    // M3: Follow nearest vanguard at r1 — TIGHT formation
-    if (vanguards.length > 0) {
-      const nearest = findClosestByRange(creep, vanguards);
-      if (nearest && getRange(creep, nearest) > 1) {
-        creep.moveTo(nearest, moveOpts); return;
+    // M3: Follow designated TANK — position BEHIND them (opposite from enemies)
+    // Use aggressivePathOpts: formation point is SAFE by construction (behind
+    // vanguard), but it's within ENEMY_THREAT_RADIUS so pathOpts penalizes it.
+    const tank = currentTank ? myVanguards.find(v => v.id === currentTank) : null;
+    const followTarget = tank || (myVanguards.length > 0 ? findClosestByRange(creep, myVanguards) : null);
+    if (followTarget) {
+      // LEASH: Never advance AHEAD of vanguard screen toward enemies.
+      // Medics have fewer heavy parts → walk faster → outpace vanguards →
+      // arrive at enemy line before melee screen exists → focused → killed.
+      // Check: for the medic's nearest enemy, is ANY vanguard strictly closer?
+      // If not, medic is exposed — hold or step back toward vanguard.
+      if (enemies.length > 0 && myVanguards.length > 0) {
+        const nearestEn = findClosestByRange(creep, enemies);
+        if (nearestEn) {
+          const myDist = getRange(creep, nearestEn);
+          const anyVanCloser = myVanguards.some(v => getRange(v, nearestEn) < myDist);
+          if (!anyVanCloser) {
+            if (getRange(creep, followTarget) > 1) {
+              moveToward(creep, followTarget);
+            }
+            return;
+          }
+        }
       }
-      return; // At r1 of vanguard — hold and heal
+
+      const dist = getRange(creep, followTarget);
+      if (dist <= 1) {
+        // At r1 of tank — use MOVE slot to follow if tank advances.
+        moveToward(creep, followTarget);
+        return;
+      }
+      
+      // Navigate to formation point BEHIND vanguard with aggressive pathing
+      const fpt = getFormationPoint(followTarget);
+      creep.moveTo(fpt || followTarget, aggressivePathOpts());
+      return;
     }
 
-    // No vanguards — follow nearest combat ally at r2
-    const combatAllies = allies.filter(c => creepRoles.get(c.id) === ROLE_RANGER);
-    if (combatAllies.length > 0) {
-      const nearest = findClosestByRange(creep, combatAllies);
+    // No vanguards — follow nearest ranger at r2
+    if (myRangers.length > 0) {
+      const nearest = findClosestByRange(creep, myRangers);
       if (nearest && getRange(creep, nearest) > 2) {
         creep.moveTo(nearest, moveOpts); return;
       }
@@ -1287,11 +1464,33 @@ function doMoveAction(creep) {
   }
 
   // ── P4: Advance to objective ─────────────────────────────────────────
-  // Vanguards use aggressive pathing (they ARE the frontline).
-  // Others use influence-aware pathing for safety.
+  // Medics follow vanguards/tank, NEVER go to objective alone.
+  // ALL combat units use aggressivePathOpts — pathOpts() influence map
+  // penalizes the objective itself (since objective = enemy centroid).
+  if (role === ROLE_MEDIC) {
+    const follow = myVanguards.length > 0
+      ? findClosestByRange(creep, myVanguards)
+      : myRangers.length > 0 ? findClosestByRange(creep, myRangers) : null;
+    if (follow) {
+      // LEASH: same as M3 — never advance ahead of vanguard screen
+      if (enemies.length > 0 && myVanguards.length > 0) {
+        const nearestEn = findClosestByRange(creep, enemies);
+        if (nearestEn) {
+          const myDist = getRange(creep, nearestEn);
+          const anyVanCloser = myVanguards.some(v => getRange(v, nearestEn) < myDist);
+          if (!anyVanCloser) {
+            if (getRange(creep, follow) > 1) moveToward(creep, follow);
+            return;
+          }
+        }
+      }
+      const fpt = getFormationPoint(follow);
+      creep.moveTo(fpt || follow, aggressivePathOpts());
+      return;
+    }
+  }
   if (objective) {
-    const opts = (role === ROLE_VANGUARD) ? aggressivePathOpts() : pathOpts();
-    creep.moveTo(objective, opts);
+    creep.moveTo(objective, aggressivePathOpts());
     return;
   }
 
@@ -1342,12 +1541,16 @@ function towerController() {
     const enemiesInRange = findInRange(tower, enemies, TOWER_RANGE);
 
     if (enemiesInRange.length > 0) {
-      // Kill-secured targets first, then closest (max damage via falloff)
+      // G06: Coordinate with globalFocusTarget for concentrated burst damage
+      // Priority: killable > globalFocusTarget > closest
       const killable = enemiesInRange.filter(e => e.hits <= 200);
-      const target = killable.length > 0
-        ? findClosestByRange(tower, killable)
-        : findClosestByRange(tower, enemiesInRange);
-      if (target) { tower.attack(target); continue; }
+      if (killable.length > 0) {
+        tower.attack(findClosestByRange(tower, killable)); continue;
+      }
+      if (globalFocusTarget && enemiesInRange.some(e => e.id === globalFocusTarget.id)) {
+        tower.attack(globalFocusTarget); continue;
+      }
+      tower.attack(findClosestByRange(tower, enemiesInRange)); continue;
     }
 
     // Heal damaged allies in range
@@ -1523,6 +1726,7 @@ function dumpEndGameDiag() {
 export function loop() {
   // ─── SENSE ──────────────────────────────────────────────
   refreshWorldState();
+  trackEnemyVelocity(); // G12: enemy velocity for interception prediction
 
   // ─── INITIALIZATION (first tick) ────────────────────────
   if (!initialized) {
@@ -1535,6 +1739,9 @@ export function loop() {
   if (tick > 1 && tick % ROLE_REEVAL_TICKS === 0) {
     reevaluateRoles();
   }
+
+  // ─── PRE-COMPUTE ROLE LISTS ────────────────────────────
+  precomputeRoleLists(); // G08: eliminates redundant .filter() calls per tick
 
   // ─── REFRESH INFLUENCE MAP ─────────────────────────────
   getInfluenceMap();
